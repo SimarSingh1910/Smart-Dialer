@@ -141,6 +141,12 @@ TARGETS = ("up", "db", "migrate", "seed", "test", "sim", "loadtest", "run")
 
 def main() -> int:
     _load_dotenv()
+
+    # Must happen before anything creates an event loop.
+    from smartdialer.core.runtime import configure_event_loop
+
+    configure_event_loop()
+
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print(__doc__)
         return 0
