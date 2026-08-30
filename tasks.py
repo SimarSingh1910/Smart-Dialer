@@ -112,8 +112,17 @@ def task_migrate() -> int:
     return 0
 
 
-def task_seed() -> int:
-    print("seed: implemented in step 1 (schema and domain models)")
+def task_seed(argv: list[str]) -> int:
+    from smartdialer.core.seed import reset, seed
+
+    if "--reset" in argv:
+        reset(_dsn())
+        print("cleared all campaign data")
+    result = seed(_dsn())
+    print(
+        f"campaign {result.campaign_id}: {result.agents} agents, "
+        f"{result.borrowers} borrowers"
+    )
     return 0
 
 
@@ -158,10 +167,11 @@ def main() -> int:
         return task_test(argv)
     if target == "db":
         return task_db(argv)
+    if target == "seed":
+        return task_seed(argv)
     return {
         "up": task_up,
         "migrate": task_migrate,
-        "seed": task_seed,
         "sim": task_sim,
         "loadtest": task_loadtest,
         "run": task_run,
