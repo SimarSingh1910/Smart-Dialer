@@ -431,14 +431,24 @@ async def test_requesting_zero_or_negative_does_not_touch_the_database(
 
 async def test_longest_idle_agent_is_reserved_first(pool: Database, campaign):
     """Fair distribution. Without the ORDER BY, one agent could take every call
-    while another sits idle all shift."""
+    while another sits idle all shift.
+
+    Compares SETS, not sequences, and that is not laziness. The ORDER BY sits
+    in the subquery that decides WHICH rows to lock; the RETURNING clause of
+    the enclosing UPDATE has no defined order at all, and PostgreSQL is free to
+    emit the updated rows in whatever order the plan produced them. Asserting
+    the returned sequence tests the planner's mood -- it passed for a while and
+    then started failing once unrelated churn changed the table's physical
+    layout. The set is what the query actually guarantees, so the set is what
+    this asserts.
+    """
     agent_ids = await make_agents(pool, campaign, 5)  # staggered, oldest first
     async with pool.transaction() as cur:
         reservations = await reserve_agents(
             cur, campaign_id=campaign, worker_id="w", n=2,
             lease_seconds=LEASE_SECONDS, now=NOW,
         )
-    assert [r.agent_id for r in reservations] == agent_ids[:2]
+    assert {r.agent_id for r in reservations} == set(agent_ids[:2])
 
 
 # ---------------------------------------------------------------------------

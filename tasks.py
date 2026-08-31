@@ -140,8 +140,66 @@ def task_loadtest() -> int:
     return 0
 
 
-def task_run() -> int:
-    print("run: implemented in step 5")
+def task_run(argv: list[str]) -> int:
+    """Start a dialer worker against a campaign, on the real clock.
+
+    Defaults to the seeded demo campaign and the fast mock carrier. Pass
+    --provider flaky to dial through the badly behaved one, which is the
+    quickest way to watch duplicate and out-of-order events being absorbed in
+    the structured log.
+    """
+    import asyncio as _asyncio
+    import uuid as _uuid
+
+    from smartdialer.core.clock import RealClock
+    from smartdialer.core.config import load_settings
+    from smartdialer.core.db import Database
+    from smartdialer.core.logging import StructuredLogger, configure_logging
+    from smartdialer.core.seed import DEMO_CAMPAIGN_ID
+    from smartdialer.providers.mock_fast import make_fast_provider
+    from smartdialer.providers.mock_flaky import make_flaky_provider
+    from smartdialer.workers.dialer_worker import DialerWorker
+
+    settings = load_settings()
+    configure_logging(settings.log_level)
+
+    campaign_id = DEMO_CAMPAIGN_ID
+    if "--campaign" in argv:
+        campaign_id = _uuid.UUID(argv[argv.index("--campaign") + 1])
+    which = "fast"
+    if "--provider" in argv:
+        which = argv[argv.index("--provider") + 1]
+
+    async def main() -> None:
+        clock = RealClock()
+        database = Database(settings.dsn, min_size=settings.db_pool_min,
+                            max_size=settings.db_pool_max)
+        await database.open()
+        factory = make_flaky_provider if which == "flaky" else make_fast_provider
+        provider = factory(clock, seed=0)
+        worker = DialerWorker(
+            db=database,
+            clock=clock,
+            campaign_id=campaign_id,
+            providers=[provider],
+            settings=settings,
+            logger=StructuredLogger("dialer", clock),
+        )
+        try:
+            await worker.run()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            worker.stop()
+            await worker.close()
+            await provider.close()
+            await database.close()
+
+    print(f"dialing campaign {campaign_id} via mock_{which}; Ctrl-C to stop")
+    try:
+        _asyncio.run(main())
+    except KeyboardInterrupt:
+        print("stopped")
     return 0
 
 
@@ -169,12 +227,13 @@ def main() -> int:
         return task_db(argv)
     if target == "seed":
         return task_seed(argv)
+    if target == "run":
+        return task_run(argv)
     return {
         "up": task_up,
         "migrate": task_migrate,
         "sim": task_sim,
         "loadtest": task_loadtest,
-        "run": task_run,
     }[target]()
 
 

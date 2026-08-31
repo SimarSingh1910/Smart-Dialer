@@ -76,6 +76,9 @@ WHERE a.id IN (
     -- unlucky agent from taking every call while another takes none.
     ORDER BY state_changed_at
     LIMIT %(n)s
+    -- Note that this ORDER BY governs WHICH agents are chosen, not the order
+    -- of the RETURNING rows below: the enclosing UPDATE emits them in whatever
+    -- order the plan produced. Callers must not read anything into it.
     -- FOR UPDATE takes a row lock that lives until this transaction ends.
     -- SKIP LOCKED means a second worker arriving at the same instant neither
     -- blocks nor errors: it silently steps over the rows this worker holds and
@@ -342,3 +345,57 @@ async def count_agents_by_state(
     for row in rows:
         counts[AgentState(row["state"])] = row["n"]
     return counts
+
+
+async def get_agent(cur: AsyncCursor, *, agent_id: UUID) -> Agent | None:
+    """Read one agent, with its current version.
+
+    Every compare-and-swap needs a version to swap against, and an event-driven
+    transition (the borrower answered, the call ended) arrives without one --
+    the event knows about a call, not about the agent's row. So the caller
+    reads, decides, and swaps once. If the swap misses, it does NOT re-read and
+    retry: something else moved the agent, and the reaper is the component that
+    reconciles that, not a loop.
+    """
+    await cur.execute("SELECT * FROM agents WHERE id = %(id)s", {"id": agent_id})
+    row = await cur.fetchone()
+    return Agent.from_row(row) if row else None
+
+
+async def expire_wrap_up(
+    cur: AsyncCursor, *, now: datetime, limit: int = 500
+) -> list[UUID]:
+    """Return agents whose wrap-up timer has run out to the pool.
+
+    Wrap-up is the one part of the agent lifecycle that is deterministic: the
+    timer was set when the call ended and nothing external can change it. That
+    is why wrap-up agents contribute to the pacing forecast with no variance at
+    all -- we do not estimate whether they will be free in eight seconds, we
+    know.
+
+    Batched with SKIP LOCKED for the same reason as every other sweep here: two
+    workers running this at once must not queue behind each other.
+    """
+    await cur.execute(
+        """
+        UPDATE agents
+        SET state = 'AVAILABLE',
+            version = version + 1,
+            state_changed_at = %(now)s,
+            wrap_up_ends_at = NULL,
+            current_call_id = NULL,
+            lease_owner = NULL,
+            lease_expires_at = NULL
+        WHERE id IN (
+            SELECT id FROM agents
+            WHERE state = 'WRAP_UP'
+              AND wrap_up_ends_at <= %(now)s
+            ORDER BY wrap_up_ends_at
+            LIMIT %(limit)s
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING id
+        """,
+        {"now": now, "limit": limit},
+    )
+    return [row["id"] for row in await cur.fetchall()]
