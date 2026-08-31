@@ -350,6 +350,34 @@ class Call:
 
 
 @dataclass(frozen=True, slots=True)
+class NormalisedEvent:
+    """One provider event translated into the vocabulary the dialer speaks.
+
+    Each provider module is responsible for turning its own webhook shape into
+    this, so nothing downstream of `providers/` ever sees a provider-specific
+    payload. That is what lets the same event-application code handle a tidy
+    provider and a badly behaved one without a single conditional.
+
+    `facts` is the escape hatch for an event that carries more than one
+    timestamp -- most webhooks carry exactly one, but a reconciliation poll
+    returns everything the provider knows about a call at once. Keys are
+    `calls` column names; see CALL_FACT_COLUMNS in domain/calls.py.
+
+    provider_ts may be None: some providers do not stamp their events. The
+    applier substitutes its own clock in that case, which is a slightly late
+    but never wrong reading of when the thing happened.
+    """
+
+    provider: str
+    provider_event_id: str
+    provider_call_id: str
+    event_type: str
+    provider_ts: datetime | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
+    facts: dict[str, datetime] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderEvent:
     """One raw event as the provider delivered it.
 
