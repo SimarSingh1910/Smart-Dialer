@@ -61,7 +61,6 @@ from smartdialer.domain.calls import (
     connect_call,
     get_call,
 )
-from smartdialer.domain.decisions import record_decision
 from smartdialer.domain.snapshot import (
     build_raw_snapshot,
     load_campaign,
@@ -69,7 +68,7 @@ from smartdialer.domain.snapshot import (
 )
 from smartdialer.pacing.engine import ProviderHealthSignal, propose
 from smartdialer.providers.base import ProviderError, TelecomProvider
-from smartdialer.safety.controller import SafetyController, SafetyDecision
+from smartdialer.safety.controller import ExecutionResult, SafetyController
 
 # How long before a borrower who was not reached is dialled again.
 RETRY_AFTER_NO_ANSWER = 900.0
@@ -115,6 +114,7 @@ class DialerWorker:
         )
         self.controller = SafetyController(
             allocator=self.allocator,
+            db=db,
             clock=clock,
             logger=self._log,
             max_signal_age_seconds=settings.max_signal_age_seconds,
@@ -164,8 +164,9 @@ class DialerWorker:
     def stop(self) -> None:
         self._running = False
 
-    async def tick(self) -> SafetyDecision:
-        """One pass through the pipeline. Returns what the controller decided."""
+    async def tick(self) -> ExecutionResult:
+        """One pass through the pipeline. Returns what the controller decided
+        and what came of it."""
         now = self._clock.now()
 
         async with self._db.transaction() as cur:
@@ -195,29 +196,21 @@ class DialerWorker:
         )
 
         proposal = propose(snapshot)
-        decision = await self.controller.execute(
-            proposal=proposal, snapshot=snapshot, campaign=campaign
-        )
 
-        async with self._db.transaction() as cur:
-            await record_decision(
-                cur,
-                campaign_id=campaign.id,
-                ts=now,
-                mode=campaign.mode,
-                proposed=decision.proposed,
-                approved=decision.approved,
-                reason_code=decision.reason_code,
-                inputs={
-                    "engine_reason": proposal.reason,
-                    "engine_terms": proposal.terms,
-                    "safety_terms": decision.terms,
-                    "clamps": list(decision.clamps),
-                    "dialled": decision.dialled,
-                    "snapshot": _snapshot_for_log(snapshot),
-                },
-            )
-        return decision
+        # The controller writes the decision row itself, because it is the only
+        # component that knows all three numbers: what was proposed, what
+        # survived the clamps, and what actually started.
+        return await self.controller.execute(
+            proposal=proposal,
+            snapshot=snapshot,
+            campaign=campaign,
+            ts=now,
+            log_inputs={
+                "engine_reason": proposal.reason,
+                "engine_terms": proposal.terms,
+                "snapshot": _snapshot_for_log(snapshot),
+            },
+        )
 
     async def _health_signal(self) -> ProviderHealthSignal:
         """Reduce the carriers' health to the plain numbers the engine takes.

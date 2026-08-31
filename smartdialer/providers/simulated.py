@@ -38,6 +38,7 @@ from typing import Deque
 
 from smartdialer.core.clock import Clock
 from smartdialer.core.models import NormalisedEvent
+from smartdialer.core.runtime import drain_tasks
 from smartdialer.providers.base import (
     EventSink,
     ProviderCallRef,
@@ -546,13 +547,7 @@ class SimulatedProvider:
         are deliberately NOT drained: they are supposed to be sitting in the
         middle of a 120-second conversation.
         """
-        while True:
-            pending = [t for t in self._delivery_tasks if not t.done()]
-            if not pending:
-                return
-            done, _ = await asyncio.wait(pending, timeout=0)
-            if not done:
-                return
+        await drain_tasks(list(self._delivery_tasks))
 
     async def close(self) -> None:
         for task in list(self._script_tasks | self._delivery_tasks):

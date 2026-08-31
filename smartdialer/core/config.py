@@ -49,6 +49,20 @@ class Settings:
     # is what actually drives customer wait.
     tick_seconds: float = field(default_factory=lambda: _env_float("SMARTDIALER_TICK_SECONDS", 0.25))
     reaper_seconds: float = field(default_factory=lambda: _env_float("SMARTDIALER_REAPER_SECONDS", 1.0))
+    # Two lease tiers, and the gap between them is deliberate.
+    #
+    # An agent RESERVED with no call row yet has nothing behind them to
+    # reconcile, so if the worker holding them dies they should be back in the
+    # pool almost immediately. The batch-reservation window is exactly where a
+    # crash strands agents, and thirty seconds of idle capacity per agent is a
+    # real cost at any scale.
+    #
+    # Once a call row exists the lease is promoted to `lease_seconds`, because
+    # reclaiming that agent now means asking the carrier what happened to the
+    # call first, and reconciliation needs headroom to retry a slow provider.
+    reserve_lease_seconds: float = field(
+        default_factory=lambda: _env_float("SMARTDIALER_RESERVE_LEASE_SECONDS", 5.0)
+    )
     lease_seconds: float = field(default_factory=lambda: _env_float("SMARTDIALER_LEASE_SECONDS", 30.0))
     heartbeat_timeout_seconds: float = field(
         default_factory=lambda: _env_float("SMARTDIALER_HEARTBEAT_TIMEOUT_SECONDS", 30.0)

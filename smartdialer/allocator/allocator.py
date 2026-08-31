@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Sequence
 from uuid import UUID
 
@@ -44,6 +45,7 @@ from smartdialer.core.clock import Clock
 from smartdialer.core.config import Settings
 from smartdialer.core.db import Database
 from smartdialer.core.logging import StructuredLogger
+from smartdialer.core.runtime import drain_tasks
 from smartdialer.core.models import AgentState, Call, CallState, Campaign
 from smartdialer.domain.agents import release_agent, reserve_agents, transition_agent
 from smartdialer.domain.borrowers import (
@@ -56,6 +58,7 @@ from smartdialer.domain.calls import (
     create_call,
     terminate_call,
 )
+from smartdialer.domain.decisions import Shortfall, amend_shortfall_reason
 from smartdialer.providers.base import (
     ProviderRejected,
     ProviderTimeout,
@@ -68,6 +71,23 @@ from smartdialer.providers.base import (
 # because our own provider was down should come back quickly.
 RETRY_AFTER_REJECTED = 300.0
 RETRY_AFTER_UNAVAILABLE = 15.0
+
+
+@dataclass(frozen=True, slots=True)
+class DialBatch:
+    """What one tick's reservation actually managed to secure.
+
+    `shortfall_reason` is decided here because this is the only place that can
+    tell the two cases apart: reserve_agents coming back short means the floor
+    was empty, reserve_borrowers coming back short means the campaign is
+    running out of people to call. From outside, both look like "we dialled
+    fewer than we approved".
+    """
+
+    tickets: tuple["DialTicket", ...] = ()
+    shortfall_reason: str = "NONE"
+    agents_reserved: int = 0
+    borrowers_reserved: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +109,15 @@ class DialTicket:
     phone: str
     idempotency_key: str
     provider_name: str
+    # Which tick authorised this call. Set once the decision row exists, so a
+    # placement that fails can attribute the shortfall to the decision that
+    # caused it rather than to whichever tick happened to be running.
+    decision_id: int | None = None
+
+    def with_decision(self, decision_id: int) -> "DialTicket":
+        from dataclasses import replace
+
+        return replace(self, decision_id=decision_id)
 
 
 class CallAllocator:
@@ -138,8 +167,14 @@ class CallAllocator:
 
     # -- allocation -----------------------------------------------------
 
-    async def dial(self, *, campaign: Campaign, n: int) -> list[DialTicket]:
-        """Reserve, record intent, and start placing `n` calls.
+    async def reserve(self, *, campaign: Campaign, n: int) -> DialBatch:
+        """Reserve agents and borrowers and write the intent rows for `n` calls.
+
+        Deliberately does NOT contact the carrier, and deliberately does not
+        spawn anything. Reservation and placement are split so the decision row
+        can be written in between: a placement that fails needs a decision to
+        attribute its shortfall to, and if placing started here the carrier
+        could answer before that row existed.
 
         The database work is ONE transaction and one batch, not a loop of `n`
         round trips. That is not premature optimisation: it is the fix named in
@@ -147,13 +182,9 @@ class CallAllocator:
         agents, where every worker otherwise hammers the head of the same
         index one row at a time. The semantics are identical -- SKIP LOCKED
         hands each row to exactly one worker whether you ask for one or twenty.
-
-        Returns the tickets whose provider calls are now in flight. Placing
-        happens in background tasks: the carrier takes one to twelve seconds to
-        answer, and a tick loop that waited for it would stop pacing.
         """
         if n <= 0:
-            return []
+            return DialBatch()
 
         tickets: list[DialTicket] = []
         provider = self._choose_provider()
@@ -164,11 +195,17 @@ class CallAllocator:
                 campaign_id=campaign.id,
                 worker_id=self._settings.worker_id,
                 n=n,
-                lease_seconds=self._settings.lease_seconds,
+                # The SHORT lease. An agent reserved but not yet dialling has
+                # no call behind them, so there is nothing to reconcile and
+                # nothing to be careful about -- if this worker dies in the
+                # batch window, the agent should be back in the pool in
+                # seconds, not in half a minute. The lease is extended to the
+                # full length below, once a call row exists to justify it.
+                lease_seconds=self._settings.reserve_lease_seconds,
                 now=self._clock.now(),
             )
             if not agents:
-                return []
+                return DialBatch(shortfall_reason=Shortfall.NO_AGENTS)
 
             borrowers = await reserve_borrowers(
                 cur,
@@ -224,6 +261,12 @@ class CallAllocator:
                     target_state=AgentState.DIALING,
                     now=now,
                     current_call_id=call_id,
+                    # Promoted to the LONG lease now that a call row exists.
+                    # From here on the agent must not be reclaimed without
+                    # reconciling that call against the carrier first, and
+                    # reconciliation needs more than five seconds of headroom.
+                    lease_expires_at=now
+                    + timedelta(seconds=self._settings.lease_seconds),
                 )
                 if moved is None:
                     # Cannot happen while we hold the reservation, so if it
@@ -254,9 +297,28 @@ class CallAllocator:
 
         # The transaction has committed. Everything above is durable, so a
         # crash from here on is recoverable from the rows we just wrote.
-        for ticket in tickets:
+        return DialBatch(
+            tickets=tuple(tickets),
+            shortfall_reason=_shortfall_for(
+                requested=n, agents=len(agents), borrowers=len(borrowers)
+            ),
+            agents_reserved=len(agents),
+            borrowers_reserved=len(borrowers),
+        )
+
+    def place_all(self, batch: DialBatch, *, decision_id: int | None = None) -> None:
+        """Hand the batch to the carrier, one background task per call.
+
+        Placing is off the tick loop on purpose: a carrier takes one to twelve
+        seconds to answer, and a tick that waited for it would stop pacing for
+        exactly as long as the carrier is slow -- which is precisely when
+        pacing matters most.
+        """
+        provider = self._choose_provider()
+        for ticket in batch.tickets:
+            if decision_id is not None:
+                ticket = ticket.with_decision(decision_id)
             self._spawn(self._place(ticket, provider))
-        return tickets
 
     async def _place(self, ticket: DialTicket, provider: TelecomProvider) -> None:
         """Ask the carrier for the call, and handle the three ways it can fail."""
@@ -282,6 +344,7 @@ class CallAllocator:
                 error=str(exc),
                 idempotency_key=ticket.idempotency_key,
             )
+            await self._note_shortfall(ticket, Shortfall.PROVIDER_TIMEOUT)
             return
         except ProviderUnavailable as exc:
             log.warning("provider_unavailable", error=str(exc))
@@ -290,6 +353,7 @@ class CallAllocator:
                 reason="provider_unavailable",
                 spend_attempt=False,
                 retry_after=RETRY_AFTER_UNAVAILABLE,
+                shortfall=Shortfall.PROVIDER_REJECTED,
             )
             return
         except ProviderRejected as exc:
@@ -299,6 +363,7 @@ class CallAllocator:
                 reason="provider_rejected",
                 spend_attempt=True,
                 retry_after=RETRY_AFTER_REJECTED,
+                shortfall=Shortfall.PROVIDER_REJECTED,
             )
             return
         except Exception as exc:  # noqa: BLE001
@@ -308,6 +373,7 @@ class CallAllocator:
             # means holding a resource we might not need, which is the cheap
             # mistake.
             log.error("place_call_failed_unexpectedly", error=repr(exc))
+            await self._note_shortfall(ticket, Shortfall.PROVIDER_TIMEOUT)
             return
 
         async with self._db.transaction() as cur:
@@ -329,6 +395,24 @@ class CallAllocator:
 
         log.info("call_placed", provider_call_id=ref.provider_call_id)
 
+    async def _note_shortfall(self, ticket: DialTicket, reason: str) -> None:
+        """Attribute a placement failure to the tick that authorised it.
+
+        Only for outcomes we learn about after the decision row was written --
+        the carrier's answer arrives seconds later. Best effort: failing to
+        annotate an audit row must not become a second failure on a path that
+        is already handling one.
+        """
+        if ticket.decision_id is None:
+            return
+        try:
+            async with self._db.transaction() as cur:
+                await amend_shortfall_reason(
+                    cur, decision_id=ticket.decision_id, incoming=reason
+                )
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("could_not_record_shortfall", error=repr(exc))
+
     async def _abort(
         self,
         ticket: DialTicket,
@@ -336,6 +420,7 @@ class CallAllocator:
         reason: str,
         spend_attempt: bool,
         retry_after: float,
+        shortfall: str = "NONE",
     ) -> None:
         """Unwind a call we know was never placed.
 
@@ -347,6 +432,12 @@ class CallAllocator:
         nobody would trace back to an afternoon when a carrier was flaky.
         """
         now = self._clock.now()
+        # ONE transaction, and the release is EAGER. We know nothing was
+        # placed, so there is nothing to reconcile: making an agent sit out a
+        # thirty-second lease for a call that never existed is pure lost
+        # utilisation. This is what separating ProviderRejected from
+        # ProviderTimeout buys -- the timeout path above deliberately does the
+        # opposite and releases nothing at all.
         async with self._db.transaction() as cur:
             await terminate_call(
                 cur,
@@ -389,6 +480,11 @@ class CallAllocator:
                     retry_after_seconds=retry_after,
                 )
 
+            if shortfall != Shortfall.NONE and ticket.decision_id is not None:
+                await amend_shortfall_reason(
+                    cur, decision_id=ticket.decision_id, incoming=shortfall
+                )
+
     # -- task lifecycle -------------------------------------------------
 
     def _spawn(self, coro) -> asyncio.Task:
@@ -404,13 +500,7 @@ class CallAllocator:
         against. The worker never calls this -- waiting for the carrier is the
         thing the tick loop must not do.
         """
-        while True:
-            pending = [t for t in self._tasks if not t.done()]
-            if not pending:
-                return
-            done, _ = await asyncio.wait(pending, timeout=0)
-            if not done:
-                return
+        await drain_tasks(list(self._tasks))
 
     async def close(self) -> None:
         for task in list(self._tasks):
@@ -423,3 +513,22 @@ def call_is_bound_to_agent(call: Call) -> bool:
     """A call with an agent behind it. The progressive invariant is stated in
     terms of these: over-dial calls have no agent by construction."""
     return call.agent_id is not None
+
+
+def _shortfall_for(*, requested: int, agents: int, borrowers: int) -> str:
+    """Why a batch came back smaller than it was asked for.
+
+    Order matters. Agents are reserved first, and that caps what is then asked
+    of the borrower pool -- so reporting NO_BORROWERS when there were never
+    enough agents to need them would point at entirely the wrong problem.
+    MIXED is for the genuine case where both ran out.
+    """
+    short_agents = agents < requested
+    short_borrowers = borrowers < agents
+    if short_agents and short_borrowers:
+        return Shortfall.MIXED
+    if short_agents:
+        return Shortfall.NO_AGENTS
+    if short_borrowers:
+        return Shortfall.NO_BORROWERS
+    return Shortfall.NONE

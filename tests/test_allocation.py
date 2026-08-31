@@ -42,6 +42,7 @@ from smartdialer.domain.agents import (
 )
 from smartdialer.domain.borrowers import (
     borrowers_held_by_live_call,
+    detach_expired_leases,
     release_borrower,
     release_expired_leases,
     reserve_borrowers,
@@ -843,7 +844,7 @@ async def test_held_borrowers_are_observable(pool: Database, campaign):
     after_expiry = NOW + timedelta(seconds=LEASE_SECONDS + 1)
 
     async with pool.transaction() as cur:
-        held = await borrowers_held_by_live_call(cur, now=after_expiry)
+        held = await borrowers_held_by_live_call(cur, campaign_id=campaign)
     assert [row["borrower_id"] for row in held] == [borrower_id]
     assert held[0]["call_state"] == "RINGING"
 
@@ -867,3 +868,110 @@ async def test_a_borrower_with_a_live_call_is_never_reserved(pool: Database, cam
             lease_seconds=LEASE_SECONDS, now=NOW,
         )
     assert reservations == []
+
+
+# ---------------------------------------------------------------------------
+# The lease / terminality coupling (the two-clock rule)
+# ---------------------------------------------------------------------------
+
+
+async def test_borrower_with_non_terminal_call_is_not_returned_to_pending(
+    pool: Database, campaign
+):
+    """The rule that keeps the one-live-call index from firing on correct
+    behaviour.
+
+    A worker crashes while a call is ANSWERED and the provider is unreachable,
+    so the call stays non-terminal for a long time. The worker's CLAIM on the
+    borrower has expired; the borrower has NOT become free. If lease expiry
+    alone returned them to PENDING, the dialer would reserve them, insert a
+    second call, and hit the unique partial index -- a confusing integrity
+    error raised by allocation working exactly as designed. Worse, without that
+    index it would ring one person twice about one debt during an outage.
+
+    So: the lease is detached, the state stays RESERVED, and only the call
+    reaching a terminal state frees them.
+    """
+    borrower_id, _ = await _reserve_one_borrower_with_call(pool, campaign, "ANSWERED")
+    expired = NOW + timedelta(seconds=LEASE_SECONDS + 1)
+
+    async with pool.transaction() as cur:
+        freed = await release_expired_leases(cur, now=expired)
+        detached = await detach_expired_leases(cur, now=expired)
+
+    assert borrower_id not in freed, "a borrower on a live call must not be freed"
+    assert borrower_id in detached, "the dead worker's claim must still be dropped"
+
+    async with pool.transaction() as cur:
+        await cur.execute(
+            "SELECT state, lease_owner, lease_expires_at FROM borrowers WHERE id = %s",
+            (borrower_id,),
+        )
+        row = await cur.fetchone()
+
+    assert row["state"] == "RESERVED", "still held by the live call"
+    assert row["lease_owner"] is None, "but no worker claims them any more"
+    assert row["lease_expires_at"] is None
+
+
+async def test_detaching_the_lease_makes_the_sweep_idempotent(pool: Database, campaign):
+    """Run the pair twice; the second pass finds nothing.
+
+    This is why the lease is cleared rather than left expired. A borrower whose
+    lease stays in the past is rediscovered by every sweep forever, so the
+    reaper reports work on every pass and "did anything change?" stops being a
+    question the logs can answer.
+    """
+    borrower_id, _ = await _reserve_one_borrower_with_call(pool, campaign, "ANSWERED")
+    expired = NOW + timedelta(seconds=LEASE_SECONDS + 1)
+
+    async with pool.transaction() as cur:
+        first = await detach_expired_leases(cur, now=expired)
+    async with pool.transaction() as cur:
+        second = await detach_expired_leases(cur, now=expired)
+
+    assert first == [borrower_id]
+    assert second == [], "the second pass must be a no-op"
+
+
+async def test_a_detached_borrower_is_freed_once_the_call_ends(pool: Database, campaign):
+    """The other half of the rule. The borrower has no lease at all now, so the
+    release sweep has to accept a NULL lease or they are stranded forever."""
+    borrower_id, _ = await _reserve_one_borrower_with_call(pool, campaign, "ANSWERED")
+    expired = NOW + timedelta(seconds=LEASE_SECONDS + 1)
+
+    async with pool.transaction() as cur:
+        await detach_expired_leases(cur, now=expired)
+        # Reconciliation finishes the call.
+        await cur.execute(
+            "UPDATE calls SET state = 'COMPLETED' WHERE borrower_id = %s",
+            (borrower_id,),
+        )
+        freed = await release_expired_leases(cur, now=expired)
+
+    assert borrower_id in freed
+
+    async with pool.transaction() as cur:
+        await cur.execute("SELECT state, attempts FROM borrowers WHERE id = %s", (borrower_id,))
+        row = await cur.fetchone()
+    assert row["state"] == "PENDING"
+    # The worker crashed; the borrower was never actually reached. Charging an
+    # attempt for our failure would eventually mark a reachable person
+    # EXHAUSTED.
+    assert row["attempts"] == 0
+
+
+async def test_held_borrowers_stay_observable_after_their_lease_is_detached(
+    pool: Database, campaign
+):
+    """The stall diagnostic has to keep working once the lease is gone --
+    otherwise clearing the lease would hide exactly the set you need to see
+    when reconciliation is stuck."""
+    borrower_id, _ = await _reserve_one_borrower_with_call(pool, campaign, "ANSWERED")
+    expired = NOW + timedelta(seconds=LEASE_SECONDS + 1)
+
+    async with pool.transaction() as cur:
+        await detach_expired_leases(cur, now=expired)
+        held = await borrowers_held_by_live_call(cur, campaign_id=campaign)
+
+    assert borrower_id in [row["borrower_id"] for row in held]

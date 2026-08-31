@@ -5,6 +5,12 @@ as much as the busy ones: "why did the dialer sit idle for four minutes?" is
 answered by a run of rows whose reason_code says WINDOW_CLOSED or
 PROVIDER_BREAKER, and by nothing else.
 
+Each row carries three numbers, and they are three different facts:
+
+    proposed  what the pacing engine wanted
+    approved  what the safety controller allowed  -> reason_code says why
+    dialed    what actually started               -> shortfall_reason says why
+
 `inputs` holds the entire snapshot plus every intermediate term the engine
 computed. That is what makes the decision reproducible after the fact rather
 than merely plausible -- the engine is a pure function, so anyone holding this
@@ -23,6 +29,42 @@ from psycopg import AsyncCursor
 from smartdialer.core.models import CampaignMode, PacingDecision
 
 
+class Shortfall:
+    """Why fewer calls started than the controller approved.
+
+    NO_AGENTS and NO_BORROWERS are the two that matter and they mean opposite
+    things. NO_AGENTS is a pacing signal: the dialer had authority it could not
+    use because the floor was empty, which is the gap predictive mode exists to
+    close. NO_BORROWERS is campaign exhaustion and has nothing to do with
+    pacing at all. A single "we dialled less than we wanted" number cannot tell
+    a campaign running dry from the safety system working correctly.
+    """
+
+    NONE = "NONE"
+    NO_AGENTS = "NO_AGENTS"
+    NO_BORROWERS = "NO_BORROWERS"
+    PROVIDER_REJECTED = "PROVIDER_REJECTED"
+    PROVIDER_TIMEOUT = "PROVIDER_TIMEOUT"
+    MIXED = "MIXED"
+
+    @classmethod
+    def combine(cls, existing: str | None, incoming: str) -> str:
+        """Fold a late provider outcome into a reason already recorded.
+
+        Provider failures arrive seconds after the tick that caused them, so
+        the row is written once at decision time and amended once when a
+        carrier answers. Two different causes become MIXED rather than the
+        second silently overwriting the first.
+        """
+        if incoming == cls.NONE:
+            return existing or cls.NONE
+        if existing in (None, cls.NONE):
+            return incoming
+        if existing == incoming:
+            return existing
+        return cls.MIXED
+
+
 async def record_decision(
     cur: AsyncCursor,
     *,
@@ -31,7 +73,9 @@ async def record_decision(
     mode: CampaignMode,
     proposed: int,
     approved: int,
+    dialed: int,
     reason_code: str,
+    shortfall_reason: str,
     inputs: dict[str, Any],
 ) -> int:
     """Write one tick's decision. Returns the row id.
@@ -48,10 +92,11 @@ async def record_decision(
     await cur.execute(
         """
         INSERT INTO pacing_decisions
-            (campaign_id, ts, mode, proposed, approved, reason_code, inputs)
+            (campaign_id, ts, mode, proposed, approved, dialed,
+             reason_code, shortfall_reason, inputs)
         VALUES
             (%(campaign_id)s, %(ts)s, %(mode)s, %(proposed)s, %(approved)s,
-             %(reason_code)s, %(inputs)s)
+             %(dialed)s, %(reason_code)s, %(shortfall_reason)s, %(inputs)s)
         RETURNING id
         """,
         {
@@ -60,11 +105,39 @@ async def record_decision(
             "mode": mode.value,
             "proposed": proposed,
             "approved": approved,
+            "dialed": dialed,
             "reason_code": reason_code,
+            "shortfall_reason": shortfall_reason,
             "inputs": json.dumps(inputs, default=str),
         },
     )
     return (await cur.fetchone())["id"]
+
+
+async def amend_shortfall_reason(
+    cur: AsyncCursor, *, decision_id: int, incoming: str
+) -> None:
+    """Fold a provider outcome into a decision already written.
+
+    Done in SQL rather than read-modify-write, because several placements from
+    one tick can fail concurrently and a lost update here would misattribute
+    the cause of a shortfall -- which is the one thing this column exists to
+    get right.
+    """
+    await cur.execute(
+        """
+        UPDATE pacing_decisions
+        SET shortfall_reason = CASE
+                WHEN shortfall_reason IS NULL OR shortfall_reason = 'NONE'
+                    THEN %(incoming)s
+                WHEN shortfall_reason = %(incoming)s
+                    THEN shortfall_reason
+                ELSE 'MIXED'
+            END
+        WHERE id = %(decision_id)s
+        """,
+        {"decision_id": decision_id, "incoming": incoming},
+    )
 
 
 async def recent_decisions(

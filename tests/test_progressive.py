@@ -371,6 +371,7 @@ async def test_an_inactive_campaign_dials_nothing(pool: Database):
     try:
         first = await worker.tick()
         assert first.approved > 0
+        assert first.dialed > 0
 
         async with pool.transaction() as cur:
             await cur.execute(
@@ -379,6 +380,7 @@ async def test_an_inactive_campaign_dials_nothing(pool: Database):
 
         second = await worker.tick()
         assert second.approved == 0
+        assert second.dialed == 0
         assert second.reason_code == Reason.KILL_SWITCH
     finally:
         await worker.close()
@@ -419,25 +421,29 @@ async def test_a_controller_failure_approves_nothing(pool: Database):
     worker = make_worker(pool, clock, campaign_id, provider)
 
     class Exploding:
-        async def dial(self, **kwargs):
+        async def reserve(self, **kwargs):
             raise RuntimeError("allocator is on fire")
 
     worker.controller._allocator = Exploding()
 
     try:
-        decision = await worker.tick()
-        assert decision.approved == 0
-        assert decision.reason_code == Reason.CONTROLLER_ERROR
+        result = await worker.tick()
+        assert result.approved == 0
+        assert result.dialed == 0
+        assert result.reason_code == Reason.EXCEPTION
 
         # And it was written down. A safety event that leaves no record is
-        # indistinguishable from a quiet campaign.
+        # indistinguishable from a quiet campaign -- so the fail-closed path
+        # logs on a best-effort basis of its own.
         async with pool.transaction() as cur:
             await cur.execute(
-                "SELECT reason_code FROM pacing_decisions WHERE campaign_id = %s "
-                "ORDER BY id DESC LIMIT 1",
+                "SELECT reason_code, approved, dialed FROM pacing_decisions "
+                "WHERE campaign_id = %s ORDER BY id DESC LIMIT 1",
                 (campaign_id,),
             )
-            assert (await cur.fetchone())["reason_code"] == Reason.CONTROLLER_ERROR
+            row = await cur.fetchone()
+        assert row["reason_code"] == Reason.EXCEPTION
+        assert row["approved"] == 0 and row["dialed"] == 0
     finally:
         await worker.close()
         await provider.close()
@@ -461,8 +467,8 @@ async def test_every_tick_is_logged_with_its_inputs(pool: Database):
         await run_ticks(worker, clock, steps=12)
         async with pool.transaction() as cur:
             await cur.execute(
-                "SELECT proposed, approved, reason_code, inputs FROM pacing_decisions "
-                "WHERE campaign_id = %s ORDER BY id",
+                "SELECT proposed, approved, dialed, reason_code, shortfall_reason, "
+                "inputs FROM pacing_decisions WHERE campaign_id = %s ORDER BY id",
                 (campaign_id,),
             )
             rows = await cur.fetchall()
@@ -470,6 +476,12 @@ async def test_every_tick_is_logged_with_its_inputs(pool: Database):
         assert len(rows) == 12, "one row per tick, busy or not"
         first = rows[0]
         assert first["proposed"] == 4
+        # approved and dialed are separate facts. The first tick has four free
+        # agents and plenty of borrowers, so they agree -- but they are stored
+        # apart so that the ticks where they disagree are readable.
+        assert first["approved"] == 4
+        assert first["dialed"] == 4
+        assert first["shortfall_reason"] == "NONE"
         snapshot = first["inputs"]["snapshot"]
         # All eight signals present, not just the ones progressive reads.
         for key in (
@@ -543,3 +555,127 @@ async def test_the_invariant_holds_on_the_flaky_provider_too(pool: Database):
         await worker.close()
         await provider.close()
         await cleanup(pool, campaign_id)
+
+
+# ---------------------------------------------------------------------------
+# approved vs dialed
+# ---------------------------------------------------------------------------
+
+
+async def test_running_out_of_borrowers_is_recorded_as_no_borrowers(pool: Database):
+    """The distinction migration 002 exists for.
+
+    Twenty agents, three borrowers. The controller approves twenty -- nothing
+    in the clamps knows or should know how many people are left to call -- and
+    three calls start. Recording only `approved` would say the dialer was
+    working at full tilt; recording only `dialed` would say the safety system
+    throttled it. Neither is true, and the reason code is what tells them
+    apart: NO_BORROWERS is campaign exhaustion, NO_AGENTS would be a pacing
+    signal, and the utilization charts read completely differently depending on
+    which one it was.
+    """
+    campaign_id = await make_campaign(pool, agents=20, borrowers=3)
+    clock = VirtualClock(start=START)
+    provider = make_fast_provider(clock, seed=1, answer_rate=0.0, reject_rate=0.0)
+    worker = make_worker(pool, clock, campaign_id, provider)
+    worker.attach_providers()
+
+    try:
+        result = await worker.tick()
+        assert result.approved == 20, "the clamps do not know about the borrower pool"
+        assert result.dialed == 3, "only three calls could actually start"
+        assert result.shortfall_reason == "NO_BORROWERS"
+
+        async with pool.transaction() as cur:
+            await cur.execute(
+                "SELECT proposed, approved, dialed, shortfall_reason "
+                "FROM pacing_decisions WHERE campaign_id = %s ORDER BY id DESC LIMIT 1",
+                (campaign_id,),
+            )
+            row = await cur.fetchone()
+        assert (row["proposed"], row["approved"], row["dialed"]) == (20, 20, 3)
+        assert row["shortfall_reason"] == "NO_BORROWERS"
+    finally:
+        await worker.close()
+        await provider.close()
+        await cleanup(pool, campaign_id)
+
+
+async def test_a_provider_rejection_is_attributed_to_the_tick_that_caused_it(
+    pool: Database,
+):
+    """Carriers answer seconds after the decision, so the shortfall reason is
+    amended once the outcome is known rather than guessed at decision time."""
+    campaign_id = await make_campaign(pool, agents=4, borrowers=10)
+    clock = VirtualClock(start=START)
+    # Every call rejected: we KNOW nothing was placed.
+    provider = make_fast_provider(clock, seed=1, reject_rate=1.0)
+    worker = make_worker(pool, clock, campaign_id, provider)
+    worker.attach_providers()
+
+    try:
+        result = await worker.tick()
+        assert result.dialed == 4, "four calls started -- the carrier said no after"
+        assert result.shortfall_reason == "NONE"
+
+        await clock.advance(2.0)
+        await worker.drain()
+
+        async with pool.transaction() as cur:
+            await cur.execute(
+                "SELECT shortfall_reason FROM pacing_decisions WHERE id = %s",
+                (result.decision_id,),
+            )
+            assert (await cur.fetchone())["shortfall_reason"] == "PROVIDER_REJECTED"
+    finally:
+        await worker.close()
+        await provider.close()
+        await cleanup(pool, campaign_id)
+
+
+async def test_provider_rejected_releases_eagerly_but_timeout_does_not(pool: Database):
+    """The payoff of splitting the two provider exceptions.
+
+    A rejection means we KNOW nothing was placed, so the agent goes straight
+    back and does not sit out a lease for a call that never existed. A timeout
+    means we do NOT know -- the borrower's phone may be ringing right now -- so
+    releasing the agent could bridge them to a second person while the first is
+    live. The agent stays put and the reaper reconciles.
+
+    Run as two campaigns with the same shape, differing only in which failure
+    the carrier produces.
+    """
+    outcomes = {}
+    for label, knobs in (
+        ("rejected", {"reject_rate": 1.0}),
+        ("timeout", {"timeout_rate": 1.0, "timeout_but_placed_rate": 0.0}),
+    ):
+        campaign_id = await make_campaign(pool, agents=3, borrowers=10)
+        clock = VirtualClock(start=START)
+        provider = make_fast_provider(clock, seed=1, **knobs)
+        worker = make_worker(pool, clock, campaign_id, provider)
+        worker.attach_providers()
+        try:
+            await worker.tick()
+            # Long enough for the carrier's client timeout to fire, but far
+            # short of any lease expiring.
+            for _ in range(12):
+                await clock.advance(1.0)
+                await worker.drain()
+            outcomes[label] = await counts(pool, campaign_id)
+        finally:
+            await worker.close()
+            await provider.close()
+            await cleanup(pool, campaign_id)
+
+    assert outcomes["rejected"]["agents"].get("AVAILABLE") == 3, (
+        "a known-failed dial must free its agent immediately"
+    )
+    assert outcomes["rejected"]["calls"].get("FAILED") == 3
+
+    assert outcomes["timeout"]["agents"].get("DIALING") == 3, (
+        "an unknown outcome must leave the agent held for reconciliation"
+    )
+    assert outcomes["timeout"]["calls"].get("INITIATED") == 3, (
+        "and the call must stay in flight, not be cancelled on a guess"
+    )

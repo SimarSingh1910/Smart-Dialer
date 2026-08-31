@@ -20,8 +20,15 @@ borrower index (a confusing failure on correct behaviour) or, without that
 index, actually ring the same person twice for the same debt during a provider
 outage. The second is a compliance problem, not just an untidy one.
 
-So release is split in two, and `release_expired_leases` will not return a
-borrower to PENDING while any non-terminal call for them exists.
+So release is split in two:
+
+    lease expired, no non-terminal call   -> PENDING          (release_expired_leases)
+    lease expired, non-terminal call      -> stay RESERVED,   (detach_expired_leases)
+                                             clear the lease
+
+The second case clears only the dead worker's claim. The borrower is freed
+later, by the first query, once the call actually finishes -- which is why that
+query also accepts a NULL lease.
 """
 
 from __future__ import annotations
@@ -249,8 +256,13 @@ WHERE b.id IN (
     SELECT id
     FROM borrowers
     WHERE state = 'RESERVED'
-      AND lease_expires_at < %(now)s
-    ORDER BY lease_expires_at
+      -- A NULL lease is included deliberately. That is the state left behind
+      -- by detach_expired_leases below: the worker's claim is gone but the
+      -- borrower was still on a live call at the time. Once that call reaches
+      -- a terminal state, this is the sweep that finally frees them, and
+      -- without the NULL branch they would be stranded forever.
+      AND (lease_expires_at IS NULL OR lease_expires_at < %(now)s)
+    ORDER BY lease_expires_at NULLS FIRST
     LIMIT %(limit)s
     FOR UPDATE SKIP LOCKED
 )
@@ -266,23 +278,53 @@ WHERE b.id IN (
 RETURNING b.id
 """
 
+DETACH_EXPIRED_LEASES_SQL = f"""
+UPDATE borrowers b
+SET lease_owner      = NULL,
+    lease_expires_at = NULL,
+    version          = version + 1
+WHERE b.id IN (
+    SELECT id
+    FROM borrowers
+    WHERE state = 'RESERVED'
+      AND lease_expires_at IS NOT NULL
+      AND lease_expires_at < %(now)s
+    ORDER BY lease_expires_at
+    LIMIT %(limit)s
+    FOR UPDATE SKIP LOCKED
+)
+  -- The mirror image of the query above: these borrowers DO have a live call.
+  AND EXISTS (
+    SELECT 1 FROM calls c
+    WHERE c.borrower_id = b.id
+      AND c.state IN {NON_TERMINAL_CALL_STATES_SQL}
+  )
+RETURNING b.id
+"""
+
 HELD_BY_LIVE_CALL_SQL = f"""
 SELECT b.id AS borrower_id,
+       b.campaign_id AS campaign_id,
+       b.lease_owner AS lease_owner,
        c.id AS call_id,
        c.state AS call_state,
        c.lease_expires_at AS call_lease_expires_at
 FROM borrowers b
 JOIN calls c ON c.borrower_id = b.id
 WHERE b.state = 'RESERVED'
-  AND b.lease_expires_at < %(now)s
   AND c.state IN {NON_TERMINAL_CALL_STATES_SQL}
+  -- Scoped to one campaign when asked. An operator diagnosing a stall is
+  -- looking at a campaign, not at the whole estate, and an unfiltered answer
+  -- from a busy database is noise rather than a diagnosis.
+  AND (%(campaign_id)s::uuid IS NULL OR b.campaign_id = %(campaign_id)s)
+ORDER BY b.id
 """
 
 
 async def release_expired_leases(
     cur: AsyncCursor, *, now: datetime, limit: int = 500
 ) -> list[UUID]:
-    """Return borrowers whose worker died and who have nothing live.
+    """Return borrowers whose worker is gone and who have nothing live.
 
     Attempts are deliberately NOT incremented: the worker crashed, the borrower
     was never actually reached, and charging them an attempt for our failure
@@ -292,14 +334,39 @@ async def release_expired_leases(
     return [row["id"] for row in await cur.fetchall()]
 
 
+async def detach_expired_leases(
+    cur: AsyncCursor, *, now: datetime, limit: int = 500
+) -> list[UUID]:
+    """Drop the worker's claim on borrowers who still have a live call.
+
+    The other half of the rule at the top of this module. These borrowers do
+    NOT go back to PENDING -- a call is still in flight for them -- but the
+    dead worker's claim on them is meaningless and is cleared.
+
+    Clearing the lease rather than leaving it is what makes the reaper
+    idempotent. A borrower whose lease stays expired is rediscovered by every
+    single sweep, so the reaper reports work on every pass forever and "did
+    anything change?" stops being answerable. With the lease cleared they drop
+    out of this query and reappear only in release_expired_leases, once their
+    call is genuinely over.
+    """
+    await cur.execute(DETACH_EXPIRED_LEASES_SQL, {"now": now, "limit": limit})
+    return [row["id"] for row in await cur.fetchall()]
+
+
 async def borrowers_held_by_live_call(
-    cur: AsyncCursor, *, now: datetime
+    cur: AsyncCursor, *, campaign_id: UUID | None = None
 ) -> list[dict]:
-    """Borrowers whose lease expired but whose call is still in flight.
+    """Borrowers who are RESERVED because a call is still in flight for them.
 
     Deliberately observable. This set is where the two clocks disagree, so it
     is exactly what to look at when a campaign stalls: if it grows and does not
     drain, call reconciliation is stuck and the borrowers behind it are frozen.
+
+    No longer filtered on lease expiry. Once detach_expired_leases has done its
+    job these borrowers have NO lease at all, so a lease predicate would hide
+    precisely the ones worth seeing -- the set would empty out at the moment it
+    became interesting.
     """
-    await cur.execute(HELD_BY_LIVE_CALL_SQL, {"now": now})
+    await cur.execute(HELD_BY_LIVE_CALL_SQL, {"campaign_id": campaign_id})
     return list(await cur.fetchall())

@@ -424,9 +424,18 @@ class PacingDecision:
     proposed: int
     approved: int
     reason_code: str
+    # What the controller let through, versus what actually started. A tick
+    # that approves 17 and dials 12 is telling you two separate things, and
+    # `shortfall_reason` says which. See migration 002.
+    dialed: int = 0
+    shortfall_reason: str | None = None
     inputs: dict[str, Any] = field(default_factory=dict)
     id: int | None = None
     ts: datetime | None = None
+
+    @property
+    def shortfall(self) -> int:
+        return max(0, self.approved - self.dialed)
 
     @classmethod
     def from_row(cls, row: Mapping[str, Any]) -> "PacingDecision":
@@ -436,6 +445,8 @@ class PacingDecision:
             proposed=row["proposed"],
             approved=row["approved"],
             reason_code=row["reason_code"],
+            dialed=row.get("dialed") or 0,
+            shortfall_reason=row.get("shortfall_reason"),
             inputs=row.get("inputs") or {},
             id=row.get("id"),
             ts=row.get("ts"),
