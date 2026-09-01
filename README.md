@@ -58,6 +58,15 @@ python tasks.py loadtest  # 1,000 agents, 20 workers
 There is also a `Makefile` (`make up`, `make migrate`, ...) which forwards to
 `tasks.py`, so the commands are identical on a machine that has `make`.
 
+**Run `python tasks.py up` before anything else.** It prints the PostgreSQL
+version and confirms the connection, which is the one thing that has to be true
+for the rest to mean anything. `.env.example` already points at the role and
+database that `tasks.py db` creates, so on a default setup the `cp` needs no
+editing. If the connection is wrong, the database tests *skip* rather than fail
+— deliberate, so `pytest` still does something useful on a clone with no
+database, but it means a skipped run can look like a passing one. `up` failing
+tells you immediately; `237 passed` is what a real run prints.
+
 ## What each command prints
 
 **`python tasks.py test`** — 237 tests. The database tests skip rather than fail
