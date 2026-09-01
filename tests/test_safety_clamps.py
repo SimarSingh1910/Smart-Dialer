@@ -73,7 +73,7 @@ def campaign(**overrides) -> Campaign:
 def snapshot(**overrides) -> PacingSnapshot:
     defaults = dict(
         mode=CampaignMode.PROGRESSIVE,
-        taken_at=NOW,
+        snapshot_taken_at=NOW,
         now=NOW,
         agents_available=10,
         provider_health=ProviderHealthSignal(name="mock_fast"),
@@ -143,7 +143,7 @@ def test_inside_the_dialing_window_dialing_proceeds():
 def test_a_window_that_wraps_past_midnight_is_handled():
     """20:00-06:00 is two ranges, not an empty one. A naive start <= t <= end
     would close the campaign for the entire night it is meant to be open."""
-    late = snapshot(now=NOW.replace(hour=23), taken_at=NOW.replace(hour=23))
+    late = snapshot(now=NOW.replace(hour=23), snapshot_taken_at=NOW.replace(hour=23))
     decision = decide(
         10,
         snap=late,
@@ -185,14 +185,17 @@ def test_a_ratio_of_one_is_exactly_progressive():
 
 def test_campaign_concurrency_counts_everything_in_flight():
     """A backlog of ringing calls tightens the cap by itself."""
-    busy = snapshot(agents_available=50, calls_ringing=90, calls_connected=5)
+    # calls_ringing is per-call ring durations now, not a count.
+    busy = snapshot(
+        agents_available=50, calls_ringing=tuple(1.0 for _ in range(90)), calls_connected=5
+    )
     decision = decide(50, snap=busy, camp=campaign(max_concurrent=100))
     assert decision.approved == 5
     assert Reason.CAMPAIGN_CONCURRENCY in decision.clamps
 
 
 def test_concurrency_already_exhausted_approves_nothing():
-    full = snapshot(agents_available=50, calls_ringing=100)
+    full = snapshot(agents_available=50, calls_ringing=tuple(1.0 for _ in range(100)))
     decision = decide(50, snap=full, camp=campaign(max_concurrent=100))
     assert decision.approved == 0
     assert decision.reason_code == Reason.CAMPAIGN_CONCURRENCY
@@ -216,7 +219,7 @@ def test_nothing_proposed_is_distinguishable_from_being_clamped():
 def test_the_reason_code_names_the_binding_clamp():
     """Several clamps can have room while one bites. The row records the one
     that actually decided the number."""
-    snap = snapshot(agents_available=10, calls_ringing=95)
+    snap = snapshot(agents_available=10, calls_ringing=tuple(1.0 for _ in range(95)))
     decision = decide(100, snap=snap, camp=campaign(max_concurrent=100))
     # hard ratio allows 20, concurrency allows 5 -> concurrency is binding
     assert decision.approved == 5
@@ -234,7 +237,7 @@ def test_a_clamp_with_room_is_not_recorded():
 
 
 def test_clamps_never_produce_a_negative_approval():
-    over = snapshot(agents_available=5, calls_ringing=500)
+    over = snapshot(agents_available=5, calls_ringing=tuple(1.0 for _ in range(500)))
     decision = decide(50, snap=over, camp=campaign(max_concurrent=100))
     assert decision.approved == 0
 

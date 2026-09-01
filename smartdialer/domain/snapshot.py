@@ -36,6 +36,15 @@ from smartdialer.pacing.engine import (
 # change in behaviour -- the answer rate collapsing -- shows up quickly.
 DEFAULT_WINDOW_SECONDS = 60.0
 
+# The changepoint check looks at calls placed between LAG and SPAN seconds ago:
+# old enough to have finished ringing, recent enough to describe the present.
+# Without the lag the answer would always be "hardly any were answered",
+# because they are still ringing.
+CHANGEPOINT_SPAN_SECONDS = 90.0
+CHANGEPOINT_LAG_SECONDS = 30.0
+# What the campaign normally does, for the collapse to be measured against.
+BASELINE_WINDOW_SECONDS = 1800.0
+
 # Non-terminal call states, as a SQL literal. Kept next to the query that uses
 # it and matched to calls_inflight_idx; see the same note in borrowers.py.
 IN_FLIGHT_SQL = "('RESERVED','INITIATED','RINGING','ANSWERED','CONNECTED')"
@@ -110,14 +119,18 @@ recent AS (
       AND created_at >= %(now)s::timestamptz - make_interval(secs => %(window)s)
 ),
 setup AS (
-    -- Post-dial delay. p95 rather than the mean, because what hurts is the
-    -- tail: exposure lasts as long as the slowest calls take to connect.
-    SELECT COALESCE(
-        percentile_disc(0.95) WITHIN GROUP (
+    -- Post-dial delay. p95 sets the forecast window, because what hurts is the
+    -- tail: exposure lasts as long as the slowest calls take to connect. p50
+    -- is carried too -- the engine needs to know how much of that window a
+    -- call placed right now would actually spend ringing rather than
+    -- connecting.
+    SELECT
+        COALESCE(percentile_disc(0.95) WITHIN GROUP (
             ORDER BY EXTRACT(EPOCH FROM (ringing_at - initiated_at))
-        ),
-        0
-    )::float8 AS p95
+        ), 0)::float8 AS p95,
+        COALESCE(percentile_disc(0.50) WITHIN GROUP (
+            ORDER BY EXTRACT(EPOCH FROM (ringing_at - initiated_at))
+        ), 0)::float8 AS p50
     FROM calls
     WHERE campaign_id = %(campaign_id)s
       AND created_at >= %(now)s::timestamptz - make_interval(secs => %(window)s)
@@ -131,6 +144,34 @@ talk_history AS (
       AND created_at >= %(now)s::timestamptz - make_interval(secs => %(window)s)
       AND connected_at IS NOT NULL
       AND ended_at IS NOT NULL
+),
+changepoint AS (
+    -- Calls old enough to have resolved, but recent enough to describe now.
+    -- The engine compares how many of these were answered against how many
+    -- the long-run rate said would be, and flags the gap. The lag is
+    -- deliberate: asking "how many of the calls placed in the last five
+    -- seconds were answered?" always answers "very few", because they have
+    -- not finished ringing yet.
+    SELECT
+        count(*)::int AS resolved,
+        count(*) FILTER (WHERE answered_at IS NOT NULL)::int AS answered
+    FROM calls
+    WHERE campaign_id = %(campaign_id)s
+      AND created_at >= %(now)s::timestamptz - make_interval(secs => %(changepoint_span)s)
+      AND created_at <  %(now)s::timestamptz - make_interval(secs => %(changepoint_lag)s)
+      AND (answered_at IS NOT NULL OR ended_at IS NOT NULL)
+),
+baseline AS (
+    -- The long-run answer rate the changepoint check measures against. A wider
+    -- window than `recent`, so a genuine collapse is compared with normality
+    -- rather than with itself.
+    SELECT
+        count(*)::int AS dialled,
+        count(*) FILTER (WHERE answered_at IS NOT NULL)::int AS answered
+    FROM calls
+    WHERE campaign_id = %(campaign_id)s
+      AND created_at >= %(now)s::timestamptz - make_interval(secs => %(baseline_window)s)
+      AND initiated_at IS NOT NULL
 )
 SELECT
     (SELECT json_object_agg(state, n) FROM agent_counts) AS agent_counts,
@@ -139,7 +180,12 @@ SELECT
     (SELECT ages FROM talking)      AS talk_seconds,
     (SELECT remaining FROM wrapping) AS wrap_up_remaining,
     (SELECT p95 FROM setup)         AS setup_p95,
+    (SELECT p50 FROM setup)         AS setup_p50,
     (SELECT avg_seconds FROM talk_history) AS avg_call_duration,
+    (SELECT resolved FROM changepoint)     AS changepoint_resolved,
+    (SELECT answered FROM changepoint)     AS changepoint_answered,
+    (SELECT dialled  FROM baseline)        AS baseline_dialled,
+    (SELECT answered FROM baseline)        AS baseline_answered,
     recent.initiated, recent.answered, recent.connected,
     recent.abandoned, recent.failed
 FROM recent
@@ -156,15 +202,30 @@ class RawSnapshot:
     """
 
     campaign_id: UUID
-    taken_at: datetime
+    snapshot_taken_at: datetime
     agents: dict[AgentState, int]
     calls: dict[CallState, int]
     ring_seconds: tuple[float, ...]
     talk_seconds: tuple[float, ...]
     wrap_up_remaining: tuple[float, ...]
     setup_p95: float
+    setup_p50: float
     avg_call_duration: float
     recent: RecentBehaviour
+    # Inputs to the changepoint check: what resolved recently, and what the
+    # campaign's long-run rate says should have.
+    changepoint_resolved: int = 0
+    changepoint_answered: int = 0
+    baseline_dialled: int = 0
+    baseline_answered: int = 0
+
+    @property
+    def baseline_rate(self) -> float:
+        return (
+            self.baseline_answered / self.baseline_dialled
+            if self.baseline_dialled
+            else 0.0
+        )
 
 
 async def build_raw_snapshot(
@@ -173,10 +234,20 @@ async def build_raw_snapshot(
     campaign_id: UUID,
     now: datetime,
     window_seconds: float = DEFAULT_WINDOW_SECONDS,
+    changepoint_span_seconds: float = CHANGEPOINT_SPAN_SECONDS,
+    changepoint_lag_seconds: float = CHANGEPOINT_LAG_SECONDS,
+    baseline_window_seconds: float = BASELINE_WINDOW_SECONDS,
 ) -> RawSnapshot:
     await cur.execute(
         SNAPSHOT_SQL,
-        {"campaign_id": campaign_id, "now": now, "window": window_seconds},
+        {
+            "campaign_id": campaign_id,
+            "now": now,
+            "window": window_seconds,
+            "changepoint_span": changepoint_span_seconds,
+            "changepoint_lag": changepoint_lag_seconds,
+            "baseline_window": baseline_window_seconds,
+        },
     )
     row = await cur.fetchone()
     # `recent` always yields exactly one row (it is an ungrouped aggregate), so
@@ -189,14 +260,19 @@ async def build_raw_snapshot(
 
     return RawSnapshot(
         campaign_id=campaign_id,
-        taken_at=now,
+        snapshot_taken_at=now,
         agents=agent_counts,
         calls=call_counts,
         ring_seconds=tuple(row["ring_seconds"] or ()),
         talk_seconds=tuple(row["talk_seconds"] or ()),
         wrap_up_remaining=tuple(row["wrap_up_remaining"] or ()),
         setup_p95=float(row["setup_p95"] or 0.0),
+        setup_p50=float(row["setup_p50"] or 0.0),
         avg_call_duration=float(row["avg_call_duration"] or 0.0),
+        changepoint_resolved=row["changepoint_resolved"] or 0,
+        changepoint_answered=row["changepoint_answered"] or 0,
+        baseline_dialled=row["baseline_dialled"] or 0,
+        baseline_answered=row["baseline_answered"] or 0,
         recent=RecentBehaviour(
             window_seconds=window_seconds,
             initiated=row["initiated"],
@@ -224,21 +300,32 @@ def to_pacing_snapshot(
     campaign: Campaign,
     now: datetime,
     provider_health: ProviderHealthSignal,
+    history: "CampaignHistory | None" = None,
     overdial_credit: int = 0,
 ) -> PacingSnapshot:
     """Assemble the snapshot the engine sees.
 
-    `now` is passed separately from raw.taken_at on purpose: the difference
-    between them is how stale the reading is by the time a decision is made,
-    and the safety controller forces progressive behaviour once that gap gets
-    large. Collapsing the two would make every snapshot look perfectly fresh
-    and quietly disable that clamp.
+    `now` is passed separately from raw.snapshot_taken_at on purpose: the
+    difference between them is how stale the reading is by the time a decision
+    is made, and the safety controller forces progressive behaviour once that
+    gap gets large. Collapsing the two would make every snapshot look perfectly
+    fresh and quietly disable that clamp.
     """
-    historical_answer_rate = raw.recent.answer_rate
+    from smartdialer.domain.history import empty_history
+
+    history = history or empty_history(now, talk_prior_median=max(1.0, raw.avg_call_duration or 120.0))
+
+    # What the campaign's long-run rate says should have been answered among
+    # the calls that recently resolved, and how much that count would naturally
+    # vary. The engine compares the observation against this and reports a
+    # changepoint; acting on it is the safety controller's job.
+    baseline = raw.baseline_rate
+    predicted_mean = raw.changepoint_resolved * baseline
+    predicted_variance = raw.changepoint_resolved * baseline * (1.0 - baseline)
 
     return PacingSnapshot(
         mode=campaign.mode,
-        taken_at=raw.taken_at,
+        snapshot_taken_at=raw.snapshot_taken_at,
         now=now,
         max_concurrent=campaign.max_concurrent,
         max_overdial_ratio=float(campaign.max_overdial_ratio),
@@ -246,12 +333,18 @@ def to_pacing_snapshot(
         wrap_up_seconds=campaign.wrap_up_seconds,
         agents_available=raw.agents[AgentState.AVAILABLE],
         calls_connected=raw.calls[CallState.CONNECTED],
-        calls_ringing=raw.calls[CallState.RINGING],
-        historical_answer_rate=historical_answer_rate,
+        calls_ringing=raw.ring_seconds,
+        historical_answer_rate=raw.recent.answer_rate,
         call_setup_time_p95=raw.setup_p95,
+        call_setup_time_p50=raw.setup_p50,
         avg_call_duration=raw.avg_call_duration,
         provider_health=provider_health,
         recent_campaign_behaviour=raw.recent,
+        talk_seconds=raw.talk_seconds,
+        wrap_up_remaining=raw.wrap_up_remaining,
+        candidate_propensities=history.candidate_probabilities(),
+        ring_hazard=history.ring_hazard,
+        talk_hazard=history.talk_hazard,
         agents_reserved=raw.agents[AgentState.RESERVED],
         agents_dialing=raw.agents[AgentState.DIALING],
         agents_wrap_up=raw.agents[AgentState.WRAP_UP],
@@ -260,10 +353,10 @@ def to_pacing_snapshot(
         calls_reserved=raw.calls[CallState.RESERVED],
         calls_initiated=raw.calls[CallState.INITIATED],
         calls_answered=raw.calls[CallState.ANSWERED],
-        ring_seconds=raw.ring_seconds,
-        talk_seconds=raw.talk_seconds,
-        wrap_up_remaining=raw.wrap_up_remaining,
         overdial_credit=overdial_credit,
+        observed_answers_30s=float(raw.changepoint_answered),
+        predicted_answers_30s=predicted_mean,
+        predicted_answers_30s_variance=predicted_variance,
     )
 
 

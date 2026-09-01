@@ -42,6 +42,7 @@ from smartdialer.core.logging import StructuredLogger
 from smartdialer.core.models import Call, CallState, NormalisedEvent
 from smartdialer.domain.agents import expire_wrap_up
 from smartdialer.domain.calls import apply_event
+from smartdialer.domain.history import CampaignHistory, build_history, empty_history
 from smartdialer.domain.snapshot import (
     build_raw_snapshot,
     load_campaign,
@@ -107,6 +108,15 @@ class DialerWorker:
             campaign_id=campaign_id,
         )
 
+        # The learned distributions, rebuilt on their own schedule. Hazard
+        # curves and propensity cells move over minutes; agent counts move
+        # every tick. Rebuilding them together would spend most of the tick
+        # budget re-deriving a curve that has not changed -- and unlike the
+        # snapshot, staleness here is harmless, which is why only the snapshot
+        # has a freshness clamp in the safety controller.
+        self._history: CampaignHistory | None = None
+        self._history_refresh_seconds = 15.0
+
         self._running = False
         self._event_tasks: set[asyncio.Task] = set()
         # Surfaced rather than swallowed: a handler that raised has left some
@@ -170,6 +180,9 @@ class DialerWorker:
             raw = await build_raw_snapshot(
                 cur, campaign_id=campaign.id, now=now, window_seconds=60.0
             )
+            history = await self._refresh_history(
+                cur, campaign=campaign, raw=raw, now=now
+            )
 
         health = await self._health_signal()
         snapshot = to_pacing_snapshot(
@@ -177,8 +190,10 @@ class DialerWorker:
             campaign=campaign,
             now=self._clock.now(),
             provider_health=health,
-            # Granted by the AIMD budget in step 8. Zero means the predictive
-            # path proposes the progressive floor, which is the safe default.
+            history=history,
+            # Granted by the AIMD budget in step 8, where it becomes a ceiling
+            # the controller applies. Carried here only so it appears in the
+            # decision log; the engine does not spend it.
             overdial_credit=0,
         )
 
@@ -195,9 +210,50 @@ class DialerWorker:
             log_inputs={
                 "engine_reason": proposal.reason,
                 "engine_terms": proposal.terms,
+                # The sentence a human reads first, and the numbers behind it.
+                # "Why 17 and not 10" is answered by these fields alone.
+                "engine_explanation": proposal.explain(),
+                "mu_A": proposal.mu_A,
+                "sigma_A": proposal.sigma_A,
+                "mu_G": proposal.mu_G,
+                "sigma_G": proposal.sigma_G,
+                "p_hat": proposal.p_hat,
+                "epsilon": proposal.epsilon,
+                "window_seconds": proposal.window_seconds,
+                "changepoint_detected": proposal.changepoint_detected,
+                "used_exact_dp": proposal.used_exact_dp,
+                "search_trace": [list(pair) for pair in proposal.search_trace],
                 "snapshot": _snapshot_for_log(snapshot),
             },
         )
+
+    async def _refresh_history(self, cur, *, campaign, raw, now) -> CampaignHistory:
+        """Rebuild the learned distributions if they have gone stale.
+
+        Guarded by age rather than rebuilt every tick. Four extra queries at
+        4Hz would dominate the tick budget, and the answer would be the same
+        curve each time.
+        """
+        if (
+            self._history is not None
+            and self._history.age_seconds(now) < self._history_refresh_seconds
+        ):
+            return self._history
+        try:
+            self._history = await build_history(
+                cur,
+                campaign_id=campaign.id,
+                now=now,
+                campaign_answer_rate=raw.baseline_rate or raw.recent.answer_rate or 0.2,
+                talk_prior_median=max(1.0, raw.avg_call_duration or 120.0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # A failed rebuild must not stop the tick. The previous tables, or
+            # the priors, are still a defensible basis for a decision; no
+            # decision at all is not.
+            self._log.error("history_refresh_failed", error=repr(exc))
+            self._history = self._history or empty_history(now)
+        return self._history
 
     async def _health_signal(self) -> ProviderHealthSignal:
         """Reduce the carriers' health to the plain numbers the engine takes.
@@ -305,25 +361,29 @@ class DialerWorker:
 def _snapshot_for_log(snapshot) -> dict:
     """The snapshot, flattened for the decision log.
 
-    Every field the engine saw, so the proposal can be recomputed from the row.
-    The per-call age arrays are included: they are the inputs the step 7 hazard
-    model will run on, and a log that omitted them would not be able to explain
-    a predictive decision at all.
+    Every field the engine saw, so the proposal can be recomputed from the row
+    -- the engine being a pure function is what makes that possible, and this
+    is what makes it useful. The per-call age arrays are included because they
+    are the actual inputs to the hazard model: a log that recorded only "six
+    calls ringing" could not explain why six calls justified seventeen new ones
+    on one tick and four on the next.
     """
     return {
         "mode": snapshot.mode.value,
-        "taken_at": snapshot.taken_at,
+        "snapshot_taken_at": snapshot.snapshot_taken_at,
         "age_seconds": snapshot.age_seconds,
         "agents_available": snapshot.agents_available,
         "agents_reserved": snapshot.agents_reserved,
         "agents_dialing": snapshot.agents_dialing,
         "agents_wrap_up": snapshot.agents_wrap_up,
         "agents_offline": snapshot.agents_offline,
-        "calls_ringing": snapshot.calls_ringing,
+        "calls_ringing": list(snapshot.calls_ringing),
+        "n_ringing": snapshot.n_ringing,
         "calls_connected": snapshot.calls_connected,
         "calls_in_flight": snapshot.calls_in_flight,
         "historical_answer_rate": snapshot.historical_answer_rate,
         "call_setup_time_p95": snapshot.call_setup_time_p95,
+        "call_setup_time_p50": snapshot.call_setup_time_p50,
         "avg_call_duration": snapshot.avg_call_duration,
         "provider_health": {
             "name": snapshot.provider_health.name,
@@ -338,7 +398,9 @@ def _snapshot_for_log(snapshot) -> dict:
             "abandoned": snapshot.recent_campaign_behaviour.abandoned,
             "failed": snapshot.recent_campaign_behaviour.failed,
         },
-        "ring_seconds": list(snapshot.ring_seconds),
         "talk_seconds": list(snapshot.talk_seconds),
         "wrap_up_remaining": list(snapshot.wrap_up_remaining),
+        "candidate_propensities": list(snapshot.candidate_propensities[:20]),
+        "observed_answers_30s": snapshot.observed_answers_30s,
+        "predicted_answers_30s": snapshot.predicted_answers_30s,
     }

@@ -286,7 +286,7 @@ def _snapshot(**overrides) -> PacingSnapshot:
     now = datetime(2026, 8, 31, 10, 0, 0, tzinfo=timezone.utc)
     defaults = dict(
         mode=CampaignMode.PROGRESSIVE,
-        taken_at=now,
+        snapshot_taken_at=now,
         now=now,
         provider_health=ProviderHealthSignal(name="mock_fast"),
         recent_campaign_behaviour=RecentBehaviour(initiated=100, answered=40),
