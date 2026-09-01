@@ -120,6 +120,8 @@ class DialerWorker:
 
         self._running = False
         self._event_tasks: set[asyncio.Task] = set()
+        self.last_proposal = None
+        self.last_snapshot = None
         # Surfaced rather than swallowed: a handler that raised has left some
         # call in a state nobody reconciled, and the tests assert this is empty.
         self.event_errors: list[BaseException] = []
@@ -210,6 +212,11 @@ class DialerWorker:
         )
 
         proposal = propose(snapshot)
+        # Kept for the simulation report, which needs the engine's own terms
+        # for the tick it just ran. They are already written to the decision
+        # row; this saves the report reading back the row it just caused.
+        self.last_proposal = proposal
+        self.last_snapshot = snapshot
 
         # The controller writes the decision row itself, because it is the only
         # component that knows all three numbers: what was proposed, what

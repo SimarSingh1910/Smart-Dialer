@@ -218,6 +218,12 @@ class PacingSnapshot:
     calls_reserved: int = 0
     calls_initiated: int = 0
     calls_answered: int = 0
+    # Every RINGING call, bound and unbound alike. `calls_ringing` above holds
+    # ages for the UNBOUND ones only, because only those can create a
+    # shortfall -- but the campaign's concurrency cap is about load on the
+    # carrier, where a call is a call. Two different questions, two different
+    # counts, and conflating them silently under-counted the cap.
+    calls_ringing_count: int = 0
     # Granted by the safety controller's AIMD budget. Carried so it appears in
     # the decision log, and deliberately NOT read by the engine: the credit is
     # a ceiling the controller applies, not an allowance the engine spends.
@@ -234,10 +240,18 @@ class PacingSnapshot:
 
     @property
     def calls_in_flight(self) -> int:
+        """Everything the carrier is currently holding for us.
+
+        max() rather than a plain sum: a snapshot built by hand -- in a clamp
+        test, say -- carries ring ages and no state count, and one built from
+        the database carries both. Taking the larger means neither kind of
+        snapshot can under-count the load, and under-counting is the only
+        direction that matters for a cap.
+        """
         return (
             self.calls_reserved
             + self.calls_initiated
-            + self.n_ringing
+            + max(self.n_ringing, self.calls_ringing_count)
             + self.calls_answered
             + self.calls_connected
         )

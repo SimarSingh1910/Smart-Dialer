@@ -54,7 +54,7 @@ from smartdialer.allocator.allocator import CallAllocator, DialTicket
 from smartdialer.core.clock import Clock
 from smartdialer.core.db import Database
 from smartdialer.core.logging import StructuredLogger
-from smartdialer.core.models import Campaign
+from smartdialer.core.models import Campaign, CampaignMode
 from smartdialer.domain.decisions import Shortfall, record_decision
 from smartdialer.domain.snapshot import is_within_dialing_window
 from smartdialer.pacing.engine import PacingProposal, PacingSnapshot
@@ -71,6 +71,9 @@ class Reason:
     """
 
     UNCLAMPED = "UNCLAMPED"
+    # The engine asked for fewer calls than there are free agents, and the
+    # floor was dialled instead. See _decide.
+    PROGRESSIVE_FLOOR = "PROGRESSIVE_FLOOR"
     NOTHING_PROPOSED = "NOTHING_PROPOSED"
     KILL_SWITCH = "KILL_SWITCH"
     WINDOW_CLOSED = "WINDOW_CLOSED"
@@ -206,6 +209,35 @@ class SafetyController:
                 n = max(0, limit)
                 clamps.append(reason)
 
+        # 0. The progressive floor, and it is the only step here that can
+        #    RAISE a number rather than lower one.
+        #
+        #    In predictive mode the engine's proposal is a bound on RISK, not a
+        #    target. The risk it bounds is that more borrowers say hello than
+        #    there are agents to take them -- and a call placed for a free
+        #    agent cannot contribute to it, because that agent is reserved
+        #    before the call is placed and is waiting when the phone is
+        #    answered. So one call per free agent is safe with no prediction at
+        #    all, and the engine's number governs only the calls above that
+        #    line.
+        #
+        #    Without this, a cautious tick proposes fewer calls than there are
+        #    idle agents and predictive mode quietly performs WORSE than
+        #    progressive -- the model talking the system out of the one thing
+        #    that never needed a model. This is what "progressive is the floor,
+        #    not the alternative" means in code.
+        #
+        #    It cannot make anything unsafe: the floor is never more than
+        #    agents_available, and every clamp below still applies to it,
+        #    including the ones that reduce it to zero.
+        if snapshot.mode is CampaignMode.PREDICTIVE and n < snapshot.agents_available:
+            terms["progressive_floor"] = snapshot.agents_available
+            terms["engine_proposed_below_floor"] = True
+            n = snapshot.agents_available
+            floored = True
+        else:
+            floored = False
+
         # 1. Operator kill switch, and the campaign's own active flag. First,
         #    because nothing below it matters if dialling is off.
         if self.kill_switch or not campaign.active:
@@ -301,7 +333,9 @@ class SafetyController:
         return SafetyDecision(
             proposed=proposal.n,
             approved=n,
-            reason_code=clamps[-1] if clamps else Reason.UNCLAMPED,
+            reason_code=clamps[-1]
+            if clamps
+            else (Reason.PROGRESSIVE_FLOOR if floored else Reason.UNCLAMPED),
             clamps=tuple(clamps),
             terms=terms,
             overdial=overdial,

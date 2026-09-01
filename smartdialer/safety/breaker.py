@@ -53,6 +53,23 @@ FAILURE_RATE_LIMIT = 0.30
 TIMEOUT_RATE_LIMIT = 0.15
 MIN_SAMPLES = 10
 
+# What counts as the CARRIER failing us. This list is the whole difference
+# between a circuit breaker and a breaker that trips on a quiet afternoon: a
+# borrower not picking up is a `no_answer`, and at a 50% answer rate half of
+# every window is one. Counting those as failures would open the breaker on a
+# perfectly healthy carrier and hold a campaign at zero for the rest of the
+# run -- the numbers cannot recover while nothing is being dialled.
+#
+# So only the outcomes that are evidence about the CARRIER count: it refused
+# the call, it was unreachable, it never took the call at all, or it took the
+# call and then never told us what happened to it.
+CARRIER_FAILURES = (
+    "provider_rejected",
+    "provider_unavailable",
+    "never_placed_with_provider",
+    "exceeded_max_call_lifetime",
+)
+
 WINDOW_SECONDS = 30.0
 OPEN_SECONDS = 20.0
 # How long a claimed probe has to produce a verdict before it is treated as a
@@ -347,14 +364,20 @@ class CircuitBreaker:
         await cur.execute(
             """
             SELECT
-              count(*) FILTER (WHERE failure_reason IS NOT NULL)::int AS failed,
+              count(*) FILTER (
+                  WHERE failure_reason = ANY(%(carrier_failures)s)
+              )::int AS failed,
               count(*) FILTER (WHERE provider_call_id IS NOT NULL)::int AS accepted,
               count(*)::int AS total
             FROM calls
             WHERE campaign_id = %(campaign_id)s
               AND created_at >= %(probe_at)s
             """,
-            {"campaign_id": campaign_id, "probe_at": probe_at},
+            {
+                "campaign_id": campaign_id,
+                "probe_at": probe_at,
+                "carrier_failures": list(CARRIER_FAILURES),
+            },
         )
         row = await cur.fetchone()
         if row["failed"]:
@@ -392,7 +415,9 @@ class CircuitBreaker:
         await cur.execute(
             """
             SELECT
-              count(*) FILTER (WHERE failure_reason IS NOT NULL)::int AS failures,
+              count(*) FILTER (
+                  WHERE failure_reason = ANY(%(carrier_failures)s)
+              )::int AS failures,
               count(*)::int AS total
             FROM calls
             WHERE campaign_id = %(campaign_id)s
@@ -405,6 +430,7 @@ class CircuitBreaker:
                 "provider": provider,
                 "now": now,
                 "window": WINDOW_SECONDS,
+                "carrier_failures": list(CARRIER_FAILURES),
             },
         )
         row = await cur.fetchone()

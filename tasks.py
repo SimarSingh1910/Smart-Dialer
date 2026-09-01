@@ -130,13 +130,80 @@ def task_test(argv: list[str]) -> int:
     return subprocess.call([sys.executable, "-m", "pytest", *argv])
 
 
-def task_sim() -> int:
-    print("sim: implemented in step 9")
+def task_sim(argv: list[str]) -> int:
+    """Run every scenario in both modes, or explain one tick of a finished run.
+
+        python tasks.py sim
+        python tasks.py sim --scenario C
+        python tasks.py sim --explain C --tick 240 [--mode predictive]
+    """
+    from smartdialer.core.db import Database
+    from smartdialer.core.models import CampaignMode
+    from smartdialer.sim import report
+    from smartdialer.sim.runner import run_scenario
+    from smartdialer.sim.scenarios import ORDER, SCENARIOS
+
+    if "--explain" in argv:
+        scenario = argv[argv.index("--explain") + 1].upper()
+        tick = int(argv[argv.index("--tick") + 1]) if "--tick" in argv else 0
+        mode = argv[argv.index("--mode") + 1] if "--mode" in argv else "predictive"
+        print(report.explain(scenario, tick, mode=mode))
+        return 0
+
+    keys = (
+        [argv[argv.index("--scenario") + 1].upper()]
+        if "--scenario" in argv
+        else list(ORDER)
+    )
+    seed = int(argv[argv.index("--seed") + 1]) if "--seed" in argv else 7
+
+    async def main() -> list:
+        pool = Database(_dsn(), min_size=2, max_size=10)
+        await pool.open()
+        results = []
+        try:
+            for key in keys:
+                scenario = SCENARIOS[key]
+                for mode in (CampaignMode.PROGRESSIVE, CampaignMode.PREDICTIVE):
+                    print(
+                        f"  running {key} / {mode.value.lower():<12} "
+                        f"{scenario.description}",
+                        flush=True,
+                    )
+                    result = await run_scenario(pool, scenario, mode, seed=seed)
+                    report.write_run(result)
+                    results.append(result)
+        finally:
+            await pool.close()
+        return results
+
+    print(f"simulating {len(keys)} scenario(s) in both modes, seed {seed}")
+    results = asyncio.run(main())
+
+    print()
+    print(report.summary_table(results))
+    print()
+    print("predictive vs progressive:")
+    print(report.verdict(results))
+    print()
+    print("per-tick CSVs in sim_output/")
     return 0
 
 
-def task_loadtest() -> int:
-    print("loadtest: implemented in step 10")
+def task_loadtest(argv: list[str]) -> int:
+    """1,000 agents, 20 worker coroutines, 60 seconds of virtual time."""
+    from smartdialer.loadtest.run import run_load_test
+
+    agents = int(argv[argv.index("--agents") + 1]) if "--agents" in argv else 1000
+    workers = int(argv[argv.index("--workers") + 1]) if "--workers" in argv else 20
+    seconds = float(argv[argv.index("--seconds") + 1]) if "--seconds" in argv else 60.0
+
+    print(f"load test: {agents} agents, {workers} workers, {seconds:.0f}s virtual")
+    report = asyncio.run(
+        run_load_test(_dsn(), agents=agents, workers=workers, seconds=seconds)
+    )
+    print()
+    print(report.render())
     return 0
 
 
@@ -246,11 +313,13 @@ def main() -> int:
         return task_seed(argv)
     if target == "run":
         return task_run(argv)
+    if target == "sim":
+        return task_sim(argv)
+    if target == "loadtest":
+        return task_loadtest(argv)
     return {
         "up": task_up,
         "migrate": task_migrate,
-        "sim": task_sim,
-        "loadtest": task_loadtest,
     }[target]()
 
 

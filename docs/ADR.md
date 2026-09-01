@@ -1,7 +1,7 @@
 # Architecture decision record
 
-Written as the build progresses. Sections marked **(pending)** are filled in at the
-step that produces the evidence.
+The four questions the brief asks -- what was chosen, why, what problem it
+solves, what it makes harder -- for each decision that shaped the system.
 
 ---
 
@@ -181,10 +181,243 @@ that limit is asserted by a test rather than left to be discovered.
 
 ---
 
-## 7. Predictive pacing **(pending — steps 7 and 8)**
+## 7. Predictive pacing is a quantile decision, not a point estimate
 
-## 8. Failure handling **(pending — steps 4 and 6)**
+**What was chosen.** The engine does not estimate an answer rate and divide. It
+chooses the largest `N` such that
 
-## 9. Scale: what breaks first **(pending — step 10 supplies the measurements)**
+```
+P(answers in the next window > agents free in the next window) <= epsilon
+```
 
-## 10. What I am least confident about **(pending)**
+Both sides are sums of independent Bernoullis with *different* probabilities — a
+Poisson-binomial — so the mean and variance are cheap:
+
+```
+mu_A  = sum over unbound ringing calls of h(t_i, W)  +  sum over new calls of p_j
+mu_G  = |AVAILABLE| + sum over wrap-ups ending in W  +  sum over connected of q_k
+sigma^2 = sum h(1-h) + sum p(1-p) + sum q(1-q)     (AVAILABLE and WRAP_UP add none)
+P(shortfall) = 1 - Phi((0.5 - (mu_A - mu_G)) / sigma)      -- continuity corrected
+```
+
+`P(shortfall)` is monotone in `N`, so a binary search finds the largest safe `N`.
+Below `sigma = 2` the normal approximation is replaced by the exact
+Poisson-binomial computed by dynamic programming — that regime is the small
+campaign, where the approximation is worst and the consequences of being wrong
+are highest.
+
+**Why not a point estimate.** Customer wait and abandonment are *tail* events: a
+borrower waits only when simultaneous answers exceed free agents. The mean tells
+you almost nothing about the tail. Dial `N` calls at probability `p` and answers
+are `Binomial(N, p)`: mean `Np`, standard deviation `sqrt(Np(1-p))`, so the
+coefficient of variation falls as `1/sqrt(N)`.
+
+**The consequence that matters most: the same over-dial ratio is reckless with 20
+agents and conservative with 2,000.** Any pacing constant not scaled by pool size
+is wrong. That is why `max_credit_for()` scales the over-dial credit with the
+agent pool rather than using a fixed number — and it is also why sharding a
+campaign costs utilization, because fragmenting the pool raises the variance on
+every fragment.
+
+**Three estimators, no ML.**
+
+* Per-call answer probability from a Laplace-smoothed table keyed by
+  `(hour, attempt, prior outcome, dpd bucket)`. Heterogeneity is a control lever,
+  not just accuracy: near the abandon limit, dial low-propensity numbers.
+* Ring-to-answer as an empirical **hazard** over 2-second buckets. A call ringing
+  3 seconds and one ringing 18 have very different chances of being answered in
+  the next 2 — treating the ringing pool with a flat `p` is what produces
+  overshoot spikes.
+* The same hazard on the agent side for talk time, plus wrap-up timers, which are
+  deterministic and therefore free information carrying no variance at all.
+
+**Wilson, not the raw rate.** `p_hat` is the Wilson score lower bound at 95%.
+Four answers out of five is a raw rate of 80% and a lower bound of about 38%, so
+a thin sample cannot make the system aggressive. This is the main defence against
+over-dialling at the start of a campaign. Where `p` multiplies *risk* rather than
+*reward*, the upper bound is used instead: being conservative means different
+arithmetic on the two sides.
+
+**Two-layer control — the answer to "70% drops to 10%".** The fast open-loop
+predictor above handles known dynamics. The slow closed-loop AIMD credit corrects
+model error from observed abandons. A changepoint check runs every tick: if
+observed answers fall below the 5th percentile of what the model itself
+predicted, the credit is halved immediately rather than left to drift down.
+Adapt fast downward, slow upward — an abandoned call cannot be undone afterwards.
+
+**Progressive is the floor, and the controller may raise a proposal to reach it.**
+This is the only place in the system where anything raises a number, and it is
+deliberate. A call placed for a free agent cannot be abandoned: that agent is
+reserved before the call is placed and is waiting when the phone is answered. So
+one call per free agent needs no prediction to be safe, and the engine's bound
+governs only the calls above that line. Without this, a cautious tick proposes
+fewer calls than there are idle agents and predictive mode performs *worse* than
+progressive — the model talking the system out of the one thing that never needed
+a model. Every clamp still applies to the floor afterwards, including the ones
+that reduce it to zero.
+
+**One parameter was tuned against the simulation:** `target_shortfall_eps`, from
+0.02 to 0.005. The bound is a per-*tick* probability and the dialer ticks four
+times a second, so 2% per tick is a great many chances to be unlucky over a
+campaign, while the number that has to stay under the abandon budget is the
+total. It lives in the campaign row rather than in the engine precisely so that
+tuning it needs no code change.
+
+---
+
+## 8. Failure handling: fail closed, and reconcile rather than guess
+
+**Three provider exceptions, three different responses.** This distinction is the
+entire reason the exception hierarchy exists:
+
+| Exception | What we know | What we do |
+| --- | --- | --- |
+| `ProviderRejected` | nothing was placed, the number is at fault | fail the call, free the agent, spend one of the borrower's attempts |
+| `ProviderUnavailable` | nothing was placed, *we* are at fault | fail the call, free the agent, return the borrower without spending an attempt |
+| `ProviderTimeout` | **we do not know** | change nothing at all |
+
+The last one looks like a bug and is the only correct move: the call may be
+ringing a real person right now. Releasing the agent risks bridging them to a
+second borrower while the first is still live; re-dialling risks calling one
+person twice about one debt. So the agent stays reserved, the call stays
+`INITIATED` with its lease ticking, and the reaper reconciles against the carrier
+when it can. Charging borrowers an attempt for *our* outage would slowly mark
+perfectly reachable people `EXHAUSTED` — a quiet, permanent loss that nobody
+would trace back to an afternoon when a carrier was flaky.
+
+**The intent log.** The call row, carrying the idempotency key we are about to
+send, is written and committed *before* the carrier is called. If the worker dies
+in the gap, recovery finds a row saying "we may have placed this call" and asks
+the carrier about that exact key. Calling first and recording afterwards loses
+the call on any crash in between, and a lost call here is a live one ringing a
+stranger with nobody responsible for it.
+
+**The circuit breaker is derived, not stored.** The failure rate is recomputed
+from the `calls` table every tick rather than accumulated in memory. Every worker
+therefore computes the same answer, and a restarted worker does not begin by
+believing a dead carrier to be healthy — that removes the "stale state" failure
+category rather than handling it. Only the half-open probe claim is persisted,
+because twenty workers independently discovering a dead carrier is twenty probe
+calls at a provider that asked for one; the claim uses the same compare-and-swap
+as agent reservation.
+
+One detail worth stating because it took a simulation run to see: a borrower not
+picking up is recorded as `no_answer`, and at a 50% answer rate half of every
+window is one. Counting those as carrier failures opened the breaker on a
+perfectly healthy provider and held the campaign at zero for the rest of the run
+— and the numbers cannot recover while nothing is being dialled. Only outcomes
+that are evidence about the *carrier* count.
+
+**While the breaker is open, existing calls are reconciled, not cancelled.**
+Cancelling in-flight calls is the one action guaranteed to make a provider outage
+worse, because some of those calls have a person on the line.
+
+**Fail closed.** Any exception anywhere in the safety controller yields
+`approved = 0` and an `EXCEPTION` row in the decision log. Being wrong in this
+direction costs idle agents; being wrong in the other costs a compliance event.
+
+---
+
+## 9. Scale: what breaks first
+
+Measured by `python tasks.py loadtest`: 1,000 agents, 20 worker coroutines, 60
+seconds of virtual time, one local PostgreSQL.
+
+```
+LOADTEST_NUMBERS
+```
+
+**100 agents.** Nothing. One process, one database, a few calls per second of
+state churn.
+
+**1,000 agents.** First break: **contention at the head of the AVAILABLE index.**
+Every worker runs the same `ORDER BY state_changed_at ... FOR UPDATE SKIP LOCKED`
+and they all arrive at the same rows. `SKIP LOCKED` means they do not block, but
+they do scan past each other's locked rows, and that scan lengthens with the
+number of workers. Fixes in order: reserve in one batch per tick rather than one
+row at a time (already done — it is why `reserve()` takes `n`), then add a
+randomised bucket column so workers spread across the index instead of queueing
+at its head.
+
+Second: `count(*)` in the snapshot query starts to cost real time. Fix: maintain
+`campaign_counters` incrementally in the same transaction as the state change.
+The table is already sharded 16 ways for exactly this.
+
+**10,000 agents.** First break: **write amplification.** Roughly 10k agents on
+90-second cycles is about 110 completions/sec, times ~6 state transitions, times
+(row update + event insert) — call it 1,300 writes/sec, plus 3–5k webhooks/sec.
+In the order they would actually bite:
+
+1. Connection exhaustion → pgBouncer in transaction mode.
+2. `provider_events` table and index bloat → partition by day, drop old partitions.
+3. Webhook ingest latency → `COPY` into a staging table in 50ms batches and apply
+   in a separate loop. Ingest must stay non-blocking; application may lag.
+4. The per-campaign counter row becomes a hot row → sum over the 16 shards on
+   read, which the schema already supports.
+
+**100,000 agents.** Shard by campaign across PostgreSQL instances, one pacing
+leader per campaign elected with `pg_try_advisory_lock` — not a new system. The
+genuinely hard part is not the plumbing: **the abandon budget is global per
+campaign.** A campaign spanning shards must sub-allocate the budget per shard and
+reconcile, and sub-allocation is necessarily conservative, so utilization is
+lost. Worse, per §7, fragmenting the agent pool raises the variance on each
+fragment, which costs utilization again. The statistics penalise sharding twice,
+and no amount of infrastructure removes either penalty.
+
+---
+
+## 10. What I am least confident about
+
+**Crash reconciliation depends on the provider's status API being both accurate
+and available.** When a worker dies after `ANSWERED`, the reaper asks the carrier
+what happened to that call. If the carrier is down or lying, the system holds the
+agent reserved rather than risk bridging them to a second borrower while the
+first is still live. That is the correct trade — a double-bridge is worse than an
+idle agent — but it costs utilization at exactly the moment things are already
+going badly, and it is a dependency on an external system inside a recovery path
+that exists precisely because external systems fail.
+
+Second: the propensity and hazard tables are rebuilt every 15 seconds from the
+campaign's own recent history. Early in a campaign they are mostly prior, and the
+Wilson bound keeps that safe — but a campaign whose population changes character
+mid-run (a new borrower segment loaded at noon) is learning from a mixture, and
+nothing here detects the mixture. The changepoint check would catch the abandon
+consequences after the fact rather than the cause.
+
+---
+
+## 11. The final question
+
+> How would you build a SmartDialer that gets as much of the utilization benefit
+> of predictive dialing as possible, while retaining the deterministic safety
+> characteristics of progressive dialing?
+
+**Make progressive the floor, not the alternative.** The system dials 1:1 by
+default, and predictive dialing spends a bounded, explicitly-accounted over-dial
+credit on top of that line. Three properties make it deterministic:
+
+1. **The credit is a measured budget, not a prediction.** It is moved by an AIMD
+   controller driven by observed abandons. A wrong model cannot widen it — only
+   observed good outcomes can, one call per clean tick, and a single abandon
+   halves it.
+2. **The model's output is advisory and clamped by rules it cannot influence.**
+   The hard over-dial ratio, the concurrency cap, the dialing window and the
+   circuit breaker are pure functions of measured state. The engine is a pure
+   function with no I/O; it could not reach a carrier if it wanted to, and a test
+   on the import graph keeps it that way.
+3. **Degradation is to progressive, not to off.** Stale signals, provider
+   trouble, budget exhaustion, a changepoint, or any unhandled exception all
+   resolve to `n = agents_available` or below — exactly progressive behaviour,
+   with exactly progressive safety characteristics.
+
+Beyond that, most of the remaining benefit comes from shrinking the risk window
+rather than predicting harder: pre-warm the agent leg so bridging is a conference
+join (50–100ms on the fast mock) rather than a fresh call setup (300–900ms on the
+slow one); keep setup time low so exposure is short; skip AMD, which costs 2–4
+seconds of dead air that the borrower hears as "hello? hello?"; prefer the fast,
+low-variance carrier for over-dial calls, because high post-dial-delay variance
+is what makes the timing hazard worthless; and give a connected call with no free
+agent a bounded hold with a callback offer instead of a hard drop.
+
+**Utilization is won by reducing uncertainty, not by betting harder on a
+prediction.**

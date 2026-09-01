@@ -70,6 +70,17 @@ ringing AS (
     -- How long each call has been ringing. The count alone is not enough for
     -- the hazard model: a call ringing 3 seconds and one ringing 18 have very
     -- different chances of being answered in the next two.
+    --
+    -- agent_id IS NULL is the important line. These ages feed the ANSWERS side
+    -- of the shortfall bound -- the risk that more borrowers say hello than
+    -- there are agents to take them -- and a call that already has an agent
+    -- reserved for it cannot contribute to that risk. Its agent is held in
+    -- DIALING and is not in the available pool, so when the borrower answers
+    -- there is by construction somebody waiting. Counting those calls as risk
+    -- made the engine refuse to dial free agents, which is the progressive
+    -- floor being talked out of itself by a model that had nothing to fear.
+    -- A call recovered from a crash with its agent detached correctly reads as
+    -- risk-bearing again, because at that moment it is.
     SELECT COALESCE(
         array_agg(
             EXTRACT(EPOCH FROM (%(now)s::timestamptz - COALESCE(ringing_at, initiated_at)))::float8
@@ -79,6 +90,7 @@ ringing AS (
     FROM calls
     WHERE campaign_id = %(campaign_id)s
       AND state IN ('INITIATED','RINGING')
+      AND agent_id IS NULL
       AND COALESCE(ringing_at, initiated_at) IS NOT NULL
 ),
 talking AS (
@@ -353,6 +365,7 @@ def to_pacing_snapshot(
         calls_reserved=raw.calls[CallState.RESERVED],
         calls_initiated=raw.calls[CallState.INITIATED],
         calls_answered=raw.calls[CallState.ANSWERED],
+        calls_ringing_count=raw.calls[CallState.RINGING],
         overdial_credit=overdial_credit,
         observed_answers_30s=float(raw.changepoint_answered),
         predicted_answers_30s=predicted_mean,
