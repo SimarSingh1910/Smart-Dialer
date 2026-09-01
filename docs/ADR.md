@@ -400,6 +400,11 @@ idle agent — but it costs utilization at exactly the moment things are already
 going badly, and it is a dependency on an external system inside a recovery path
 that exists precisely because external systems fail.
 
+Third -- and this one is measured rather than suspected -- the abandon budget
+bounds how fast the over-dial allowance grows, not the abandon rate itself. See
+§12: predictive dialing in this build gains a point or three of utilization and
+does not hold the rate under the campaign's budget over a five-minute run.
+
 Second: the propensity and hazard tables are rebuilt every 15 seconds from the
 campaign's own recent history. Early in a campaign they are mostly prior, and the
 Wilson bound keeps that safe — but a campaign whose population changes character
@@ -444,3 +449,94 @@ agent a bounded hold with a callback offer instead of a hard drop.
 
 **Utilization is won by reducing uncertainty, not by betting harder on a
 prediction.**
+
+---
+
+## 12. What the simulation actually showed
+
+`python tasks.py sim`, seed 7, six scenarios in both modes, 50 agents (100 in F),
+300 seconds of virtual time each (420 for D):
+
+```
+scenario | mode         | utilization%  | connects/agent-hr  | abandon%  | wait_p50  | wait_p95
+---------+--------------+---------------+--------------------+-----------+-----------+----------
+A        | PROGRESSIVE  | 45.3          | 16.3               | 0.00      | 180       | 306
+A        | PREDICTIVE   | 46.3          | 15.6               | 8.45      | 184       | 311
+B        | PROGRESSIVE  | 65.1          | 26.9               | 0.00      | 212       | 317
+B        | PREDICTIVE   | 68.6          | 28.6               | 5.56      | 203       | 316
+C        | PROGRESSIVE  | 82.0          | 22.6               | 0.00      | 202       | 306
+C        | PREDICTIVE   | 84.1          | 20.4               | 7.61      | 213       | 317
+D        | PROGRESSIVE  | 50.8          | 17.8               | 0.78      | 770       | 1006
+D        | PREDICTIVE   | 52.9          | 18.2               | 4.17      | 706       | 1044
+E        | PROGRESSIVE  | 59.4          | 26.2               | 0.00      | 210       | 311
+E        | PREDICTIVE   | 59.6          | 25.2               | 7.89      | 213       | 330
+F        | PROGRESSIVE  | 67.8          | 26.9               | 0.00      | 203       | 310
+F        | PREDICTIVE   | 64.2          | 28.4               | 5.58      | 194       | 319
+```
+
+**The honest reading: predictive gains 0.2 to 3.5 points of utilization in five of
+six scenarios, and it does not hold the abandon rate under the 3% budget in any
+of them.** The submission's thesis is half-demonstrated, and the half that fails
+is the more important one.
+
+Two things are worth separating here, because they are different kinds of
+finding.
+
+**What did work.** Every safety mechanism behaved as designed and is visible in
+the per-tick CSVs. The AIMD credit collapses to zero within a tick or two of each
+abandon and climbs back one call at a time. Scenario D's answer-rate collapse
+takes the credit to zero and holds it there. Scenario E's outage opens the
+breaker, existing calls are reconciled rather than cancelled, and the campaign
+resumes on the half-open probe. Scenario F loses 40 of 100 agents and the floor
+tracks the smaller pool within a tick. Progressive abandons essentially nobody in
+every scenario, which is the deterministic floor the design promises. Wait times
+tell the pre-warm story exactly as predicted: ~200ms p50 on the fast carrier
+against ~750ms on the slow one, and no amount of pacing recovers that difference.
+
+**What did not, and why.** The abandon budget is a rate limiter on the
+*allowance*, not a cap on the *rate*. It halves the credit after an abandon, but
+nothing stops the credit that is subsequently re-earned from abandoning again,
+and over a five-minute run those recurrences accumulate to 4-8%. Underneath that
+is a structural problem this simulation made visible and the unit tests could
+not: **the progressive floor and the over-dial calls compete for the same free
+agents, and the floor always wins.** Every tick, the floor binds an agent to each
+free agent's new call. An over-dial call placed on tick *t* is answered around
+tick *t+40*, by which time every agent free at *t* has been bound to a call of
+their own. The over-dial call is then answered into an empty pool, and that is an
+abandon — the bet placed and immediately undermined by the same mechanism that
+placed it.
+
+The fix follows from the diagnosis and is not a parameter: a borrower already
+saying hello outranks a call that has not been placed yet, so the floor should
+hold back one free agent for each unbridged over-dial call in the air. I
+implemented that and measured it (scenario B: abandon 5.9% -> 3.3%, utilization
+69.3% -> 65.1%) and then reverted it, because holding agents idle cost more
+utilization than the rescued connections returned. That trade is a real result
+rather than a failed experiment: it says the gain from over-dialling in this
+regime is smaller than the cost of reserving capacity to make over-dialling safe,
+which is a specific, measurable version of the frontier argument in §7 --
+utilization and customer wait are opposed, and the only way to move the frontier
+rather than slide along it is to reduce variance.
+
+What I would do next, in order, and what I would expect from each:
+
+1. **Bridge from the ringing pool rather than the answered one.** When an agent
+   becomes free, hand them the over-dial call that is *closest to being
+   answered* instead of placing a new call for them. This removes the
+   competition entirely rather than arbitrating it, and it is the shape real
+   predictive dialers actually have: the over-dial pool is the primary
+   mechanism, not a supplement to 1:1 dialling.
+2. **Make the abandon budget a hard rate cap, not just an AIMD allowance.**
+   Refuse over-dial entirely while the trailing abandon rate exceeds the budget,
+   rather than only shrinking the credit. The cooldown already does this on a
+   60-second window; the window is too short to bound a five-minute rate.
+3. **Widen the forecast horizon to setup + ring**, so both sides of the bound are
+   measured over the period in which the calls actually land. I tried this in
+   isolation (scenario B got worse: more over-dial, more abandons) and I believe
+   it is right but only in combination with (1), because on its own it authorises
+   more of the calls that (1) is needed to rescue.
+
+I would rather submit this with the number that did not work stated plainly than
+with a scenario list trimmed to the ones that did. The safety machinery is the
+part of this system I would defend; the pacing gain, at these pool sizes and with
+this floor-versus-over-dial arbitration, is not yet earned.

@@ -71,16 +71,24 @@ clone.
 .....................                                                    [100%]
 ```
 
-**`python tasks.py sim`** — runs six scenarios in both modes (about 15 minutes;
-the campaigns are virtual-time, the database work is real) and prints the
-comparison the whole submission rests on:
+**`python tasks.py sim`** — runs six scenarios in both modes (about 25 minutes;
+the campaigns run on virtual time, but the database work is real) and prints the
+comparison:
 
 ```
 scenario | mode         | utilization%  | connects/agent-hr  | abandon%  | wait_p50  | wait_p95
 ---------+--------------+---------------+--------------------+-----------+-----------+----------
-B        | PROGRESSIVE  | 63.9          | 28.6               | 0.84      | 199       | 306
-B        | PREDICTIVE   | 68.1          | 28.3               | 2.48      | 200       | 315
+B        | PROGRESSIVE  | 65.1          | 26.9               | 0.00      | 212       | 317
+B        | PREDICTIVE   | 68.6          | 28.6               | 5.56      | 203       | 316
 ```
+
+Predictive gains 0.2–3.5 points of utilization in five of the six scenarios and
+**does not hold the abandon rate under the 3% budget in any of them.** The
+safety machinery all behaves as designed — the credit collapses on every
+abandon, the breaker opens and recovers through its probe, the floor tracks a
+shrinking agent pool — but the budget bounds how fast the over-dial allowance
+grows rather than the rate itself. §12 of `docs/ADR.md` has the full table, the
+diagnosis, and what I would change next.
 
 Per-tick CSVs land in `sim_output/`. Useful flags:
 
