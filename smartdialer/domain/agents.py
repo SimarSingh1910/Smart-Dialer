@@ -399,3 +399,77 @@ async def expire_wrap_up(
         {"now": now, "limit": limit},
     )
     return [row["id"] for row in await cur.fetchall()]
+
+
+async def agents_with_expired_leases(
+    cur: AsyncCursor, *, now: datetime, states: tuple[AgentState, ...], limit: int = 500
+) -> list[Agent]:
+    """Leased agents in the given states whose worker has stopped renewing.
+
+    Served by the partial agents_lease_idx, so the sweep is proportional to
+    work in flight rather than to the size of the fleet. SKIP LOCKED so two
+    reapers do not queue behind each other.
+    """
+    await cur.execute(
+        """
+        SELECT * FROM agents
+        WHERE state = ANY(%(states)s)
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at < %(now)s
+        ORDER BY lease_expires_at
+        LIMIT %(limit)s
+        FOR UPDATE SKIP LOCKED
+        """,
+        {"states": [s.value for s in states], "now": now, "limit": limit},
+    )
+    return [Agent.from_row(row) for row in await cur.fetchall()]
+
+
+async def expire_stale_heartbeats(
+    cur: AsyncCursor, *, now: datetime, timeout_seconds: float, limit: int = 500
+) -> list[UUID]:
+    """Take agents offline once they stop reporting in.
+
+    This is the brief's third failure scenario: a hundred agents available,
+    forty vanish inside a few seconds. How fast the dialer notices is bounded
+    entirely by this timeout, and the cost of noticing late is calls placed for
+    agents who are not there -- which is to say, abandoned calls.
+
+    Two deliberate restrictions.
+
+    Only agents who have EVER reported in are eligible. A NULL heartbeat means
+    an agent has not arrived, not that they have gone missing, and treating the
+    two alike would take the whole fleet offline the moment this sweep first
+    ran against seeded data.
+
+    Only agents who are not mid-call. Somebody in DIALING or CONNECTED may have
+    a live borrower on the line, and dropping them here would abandon that call
+    to tidy up a session. Those agents come back through their call: it hits
+    max_call_lifetime, is reconciled, settles the agent to AVAILABLE, and this
+    sweep takes them offline on a later pass. Slower, and it never drops a
+    stranger mid-sentence.
+    """
+    await cur.execute(
+        """
+        UPDATE agents
+        SET state = 'OFFLINE',
+            version = version + 1,
+            state_changed_at = %(now)s,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            wrap_up_ends_at = NULL
+        WHERE id IN (
+            SELECT id FROM agents
+            WHERE state IN ('AVAILABLE', 'WRAP_UP', 'PAUSED')
+              AND last_heartbeat_at IS NOT NULL
+              AND last_heartbeat_at < %(now)s::timestamptz
+                                      - make_interval(secs => %(timeout_seconds)s)
+            ORDER BY last_heartbeat_at
+            LIMIT %(limit)s
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING id
+        """,
+        {"now": now, "timeout_seconds": timeout_seconds, "limit": limit},
+    )
+    return [row["id"] for row in await cur.fetchall()]

@@ -656,8 +656,14 @@ async def test_heartbeat_records_liveness(pool: Database, campaign):
     async with pool.transaction() as cur:
         assert await heartbeat(cur, agent_ids=agent_ids, now=NOW) == 2
     async with pool.cursor() as cur:
+        # Scoped to this campaign. The unscoped version counted every agent in
+        # the database that happened to share the timestamp, so it depended on
+        # what other test files had left lying around -- it passed until a new
+        # fixture seeded agents at the same instant.
         await cur.execute(
-            "SELECT count(*) AS n FROM agents WHERE last_heartbeat_at = %s", (NOW,)
+            "SELECT count(*) AS n FROM agents "
+            "WHERE campaign_id = %s AND last_heartbeat_at = %s",
+            (campaign, NOW),
         )
         assert (await cur.fetchone())["n"] == 2
 

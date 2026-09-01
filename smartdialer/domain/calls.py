@@ -55,6 +55,7 @@ from psycopg import AsyncCursor
 
 from smartdialer.core.models import (
     CALL_STATE_RANK,
+    TERMINAL_CALL_STATES,
     Call,
     CallState,
     CampaignCounters,
@@ -153,6 +154,27 @@ class EventResult:
     # call. See unapplied_events().
     UNKNOWN_CALL = "UNKNOWN_CALL"
     IGNORED = "IGNORED"
+    # The reaper and the carrier disagreed about how a call ended. Written as
+    # TERMINAL_CONFLICT:<ours><-<theirs>. See terminal_conflict() below.
+    TERMINAL_CONFLICT = "TERMINAL_CONFLICT"
+
+
+def terminal_conflict(ours: CallState, theirs: CallState) -> str:
+    """Label a call whose ending we inferred and the carrier later contradicted.
+
+    All terminal states share rank 9, so the first one written stands. That is
+    the right rule -- it is what stops a late COMPLETED erasing an ABANDONED --
+    but it has a consequence worth measuring: when the reaper force-fails a
+    call at max_call_lifetime and the provider afterwards reports it COMPLETED,
+    the outcome on record is now locally INFERRED rather than provider truth.
+
+    The facts still absorb through COALESCE, so the answer rate stays honest.
+    What changes is the confidence behind the final state, and the honest thing
+    is to count how often it happens rather than let it hide behind a rule that
+    is correct in general. "How often did my reaper guess wrong about a call
+    the carrier knew about" is a number worth being able to quote.
+    """
+    return f"{EventResult.TERMINAL_CONFLICT}:{ours.value}<-{theirs.value}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -628,7 +650,19 @@ async def _apply_stored(
         )
 
     # --- 5. record the outcome on the event row -----------------------
-    result = EventResult.APPLIED if transitioned else EventResult.STALE
+    if transitioned:
+        result = EventResult.APPLIED
+    elif (
+        CALL_STATE_RANK[target_state] == TERMINAL_RANK
+        and previous_state in TERMINAL_CALL_STATES
+        and previous_state is not target_state
+    ):
+        # Both sides think the call is over and they disagree about how. Ours
+        # stands, because it was written first, but the disagreement is
+        # recorded rather than flattened into an ordinary STALE.
+        result = terminal_conflict(previous_state, target_state)
+    else:
+        result = EventResult.STALE
     await _finish_event(cur, event_row_id, applied=True, result=result)
 
     return EventApplication(
@@ -991,3 +1025,101 @@ async def count_calls_by_state(
     for row in await cur.fetchall():
         counts[CallState(row["state"])] = row["n"]
     return counts
+
+
+# ---------------------------------------------------------------------------
+# The reaper's worklist
+# ---------------------------------------------------------------------------
+
+
+async def calls_with_expired_leases(
+    cur: AsyncCursor, *, now: datetime, limit: int = 200
+) -> list[Call]:
+    """Non-terminal calls whose worker has stopped renewing their lease.
+
+    Served by the partial calls_lease_idx, so the sweep costs what is in flight
+    rather than what the table holds. SKIP LOCKED so two reapers can run at
+    once without queueing -- and, more importantly, so a call already being
+    reconciled by one reaper is not picked up by another and reconciled twice
+    against the carrier.
+    """
+    await cur.execute(
+        """
+        SELECT * FROM calls
+        WHERE state IN ('QUEUED','RESERVED','INITIATED','RINGING','ANSWERED','CONNECTED')
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at < %(now)s
+        ORDER BY lease_expires_at
+        LIMIT %(limit)s
+        FOR UPDATE SKIP LOCKED
+        """,
+        {"now": now, "limit": limit},
+    )
+    return [Call.from_row(row) for row in await cur.fetchall()]
+
+
+async def calls_over_lifetime(
+    cur: AsyncCursor, *, now: datetime, max_seconds: float, limit: int = 200
+) -> list[Call]:
+    """Calls that have been non-terminal for implausibly long.
+
+    The backstop for a call the carrier has simply forgotten about: no events,
+    no status change, nothing. Reconciliation should have caught it, so
+    anything here means reconciliation itself is failing, and forcing the call
+    closed is a last resort that must be alarmed rather than done quietly.
+    """
+    await cur.execute(
+        """
+        SELECT * FROM calls
+        WHERE state IN ('QUEUED','RESERVED','INITIATED','RINGING','ANSWERED','CONNECTED')
+          AND created_at < %(now)s::timestamptz - make_interval(secs => %(max_seconds)s)
+        ORDER BY created_at
+        LIMIT %(limit)s
+        FOR UPDATE SKIP LOCKED
+        """,
+        {"now": now, "max_seconds": max_seconds, "limit": limit},
+    )
+    return [Call.from_row(row) for row in await cur.fetchall()]
+
+
+async def extend_call_lease(
+    cur: AsyncCursor, *, call_id: UUID, seconds: float, now: datetime, owner: str
+) -> None:
+    """Give a call another lease period, and take ownership of it.
+
+    Used by the reaper when it has reconciled a call and found it genuinely
+    still live. Without this the same call would be re-reconciled on every
+    single sweep -- one provider round trip per second, per stuck call, which
+    is how a struggling carrier gets a retry storm on top of its problems.
+    """
+    await cur.execute(
+        """
+        UPDATE calls
+        SET lease_owner = %(owner)s,
+            lease_expires_at = %(now)s::timestamptz + make_interval(secs => %(seconds)s)
+        WHERE id = %(call_id)s
+        """,
+        {"call_id": call_id, "seconds": seconds, "now": now, "owner": owner},
+    )
+
+
+async def count_terminal_conflicts(cur: AsyncCursor, *, campaign_id: UUID) -> int:
+    """How often our inferred ending contradicted the carrier's.
+
+    A metric, not an error count. A handful means the reaper is doing its job
+    on a flaky carrier; a lot means max_call_lifetime is too aggressive and the
+    reaper is closing calls that were merely slow.
+    """
+    await cur.execute(
+        """
+        SELECT count(*)::int AS n
+        FROM provider_events e
+        WHERE e.apply_result LIKE 'TERMINAL_CONFLICT:%%'
+          AND e.provider_call_id IN (
+              SELECT provider_call_id FROM calls
+              WHERE campaign_id = %(campaign_id)s AND provider_call_id IS NOT NULL
+          )
+        """,
+        {"campaign_id": campaign_id},
+    )
+    return (await cur.fetchone())["n"]

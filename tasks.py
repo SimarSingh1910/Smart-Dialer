@@ -159,6 +159,7 @@ def task_run(argv: list[str]) -> int:
     from smartdialer.providers.mock_fast import make_fast_provider
     from smartdialer.providers.mock_flaky import make_flaky_provider
     from smartdialer.workers.dialer_worker import DialerWorker
+    from smartdialer.workers.reaper import Reaper
 
     settings = load_settings()
     configure_logging(settings.log_level)
@@ -185,12 +186,28 @@ def task_run(argv: list[str]) -> int:
             settings=settings,
             logger=StructuredLogger("dialer", clock),
         )
+        # The reaper runs alongside the worker rather than as a separate
+        # process, which is a deployment convenience and nothing more: it
+        # coordinates with every other reaper through SKIP LOCKED, so running
+        # one per worker, one per host or one per cluster are all correct.
+        reaper = Reaper(
+            db=database,
+            clock=clock,
+            campaign_id=campaign_id,
+            providers=[provider],
+            settings=settings,
+            logger=StructuredLogger("reaper", clock),
+        )
+        reaper_task = _asyncio.ensure_future(reaper.run())
         try:
             await worker.run()
         except KeyboardInterrupt:
             pass
         finally:
             worker.stop()
+            reaper.stop()
+            reaper_task.cancel()
+            await _asyncio.gather(reaper_task, return_exceptions=True)
             await worker.close()
             await provider.close()
             await database.close()

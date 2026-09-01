@@ -438,12 +438,19 @@ class SimulatedProvider:
             await self._emit(call, "answered", call.answered_at)
 
             # The borrower is now listening to silence. Polling rather than an
-            # event is deliberate: it keeps this readable and it costs nothing
-            # on a virtual clock, where a sleeping task is just an entry in a
-            # heap.
+            # event is deliberate: it keeps this readable, and on a virtual
+            # clock a sleeping task is just an entry in a heap.
+            #
+            # The step is a FRACTION of the wait rather than a fixed tenth of a
+            # second. Virtual time is advanced in one jump by tests and by the
+            # simulation, and every wake-up in that jump costs a full settle
+            # pass -- so a fixed 0.1s poll turns a ten-minute advance into six
+            # thousand of them and the run appears to hang. Twenty polls give
+            # ample resolution against a patience measured in seconds.
+            patience = self.profile.answer_patience_seconds
             waited = 0.0
-            step = 0.1
-            while waited < self.profile.answer_patience_seconds:
+            step = max(0.05, patience / 20.0)
+            while waited < patience:
                 if call.bridged or not call.live:
                     break
                 await self._clock.sleep(step)
