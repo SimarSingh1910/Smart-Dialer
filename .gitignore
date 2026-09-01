@@ -7,3 +7,6 @@ venv/
 .env
 sim_output/
 loadtest_output/
+
+# Local run output, not part of the submission
+*.log
