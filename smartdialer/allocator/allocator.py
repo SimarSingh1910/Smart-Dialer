@@ -102,7 +102,11 @@ class DialTicket:
 
     call_id: UUID
     campaign_id: UUID
-    agent_id: UUID
+    # NULL on an over-dial call: it is placed before anybody is bound to it,
+    # and an agent is found at the moment somebody answers. That gap is the
+    # risk predictive dialling takes on, and it is why the abandon budget
+    # exists to bound how many of these may be in the air at once.
+    agent_id: UUID | None
     agent_version: int
     borrower_id: UUID
     borrower_version: int
@@ -155,19 +159,31 @@ class CallAllocator:
     def provider_for(self, name: str) -> TelecomProvider | None:
         return next((p for p in self._providers if p.name == name), None)
 
-    def _choose_provider(self) -> TelecomProvider:
+    def _choose_provider(self, name: str | None = None) -> TelecomProvider:
         """Which carrier to dial through.
 
-        The first configured one, for now. Step 8 makes this breaker-aware --
-        route away from a provider whose breaker is open, and prefer the fast,
-        low-variance carrier for over-dial calls, where a wide spread in setup
-        time is what makes the timing model useless.
+        The name comes from the circuit breaker, which is the only component
+        that knows which carriers are currently taking our calls. Falling back
+        to the first configured provider rather than raising is deliberate: a
+        breaker that named a provider we no longer have configured should cost
+        a suboptimal route, not a dead tick.
         """
+        if name is not None:
+            chosen = self.provider_for(name)
+            if chosen is not None:
+                return chosen
         return self._providers[0]
 
     # -- allocation -----------------------------------------------------
 
-    async def reserve(self, *, campaign: Campaign, n: int) -> DialBatch:
+    async def reserve(
+        self,
+        *,
+        campaign: Campaign,
+        n: int,
+        overdial: int = 0,
+        provider_name: str | None = None,
+    ) -> DialBatch:
         """Reserve agents and borrowers and write the intent rows for `n` calls.
 
         Deliberately does NOT contact the carrier, and deliberately does not
@@ -186,15 +202,22 @@ class CallAllocator:
         if n <= 0:
             return DialBatch()
 
+        # `overdial` of the approved calls are placed with no agent behind
+        # them. The number comes from the safety controller's AIMD credit and
+        # nowhere else -- the allocator does not decide how much over-dialling
+        # is acceptable, it only carries it out.
+        overdial = max(0, min(overdial, n))
+        bound = n - overdial
+
         tickets: list[DialTicket] = []
-        provider = self._choose_provider()
+        provider = self._choose_provider(provider_name)
 
         async with self._db.transaction() as cur:
             agents = await reserve_agents(
                 cur,
                 campaign_id=campaign.id,
                 worker_id=self._settings.worker_id,
-                n=n,
+                n=bound,
                 # The SHORT lease. An agent reserved but not yet dialling has
                 # no call behind them, so there is nothing to reconcile and
                 # nothing to be careful about -- if this worker dies in the
@@ -204,14 +227,14 @@ class CallAllocator:
                 lease_seconds=self._settings.reserve_lease_seconds,
                 now=self._clock.now(),
             )
-            if not agents:
+            if not agents and overdial == 0:
                 return DialBatch(shortfall_reason=Shortfall.NO_AGENTS)
 
             borrowers = await reserve_borrowers(
                 cur,
                 campaign_id=campaign.id,
                 worker_id=self._settings.worker_id,
-                n=len(agents),
+                n=len(agents) + overdial,
                 lease_seconds=self._settings.lease_seconds,
                 now=self._clock.now(),
             )
@@ -295,12 +318,55 @@ class CallAllocator:
                     )
                 )
 
+            # The over-dial calls. Same intent-log ordering, same idempotency
+            # key, no agent. Nothing is bound and nothing is promised: if one
+            # of these is answered, bridging.py looks for a free agent then,
+            # and records an abandon if there is none. That is the honest shape
+            # of the bet -- the credit that authorised these calls is the
+            # measured budget for exactly that outcome.
+            for borrower in borrowers[len(agents) :]:
+                now = self._clock.now()
+                call_id = uuid.uuid4()
+                await create_call(
+                    cur,
+                    call_id=call_id,
+                    campaign_id=campaign.id,
+                    borrower_id=borrower.borrower_id,
+                    provider=provider.name,
+                    idempotency_key=f"{call_id}",
+                    now=now,
+                    worker_id=self._settings.worker_id,
+                    agent_id=None,
+                    is_overdial=True,
+                    attempt=borrower.attempts + 1,
+                    lease_seconds=self._settings.lease_seconds,
+                )
+                tickets.append(
+                    DialTicket(
+                        call_id=call_id,
+                        campaign_id=campaign.id,
+                        agent_id=None,
+                        agent_version=0,
+                        borrower_id=borrower.borrower_id,
+                        borrower_version=borrower.version,
+                        phone=borrower.phone,
+                        idempotency_key=f"{call_id}",
+                        provider_name=provider.name,
+                    )
+                )
+
         # The transaction has committed. Everything above is durable, so a
         # crash from here on is recoverable from the rows we just wrote.
         return DialBatch(
             tickets=tuple(tickets),
             shortfall_reason=_shortfall_for(
-                requested=n, agents=len(agents), borrowers=len(borrowers)
+                requested=n,
+                # Over-dial calls need no agent, so they count towards the
+                # capacity this batch secured. Reporting NO_AGENTS for calls
+                # that were never going to have one would point the shortfall
+                # analysis at the wrong pool entirely.
+                agents=len(agents) + overdial,
+                borrowers=len(borrowers),
             ),
             agents_reserved=len(agents),
             borrowers_reserved=len(borrowers),
@@ -314,11 +380,10 @@ class CallAllocator:
         exactly as long as the carrier is slow -- which is precisely when
         pacing matters most.
         """
-        provider = self._choose_provider()
         for ticket in batch.tickets:
             if decision_id is not None:
                 ticket = ticket.with_decision(decision_id)
-            self._spawn(self._place(ticket, provider))
+            self._spawn(self._place(ticket, self._choose_provider(ticket.provider_name)))
 
     async def _place(self, ticket: DialTicket, provider: TelecomProvider) -> None:
         """Ask the carrier for the call, and handle the three ways it can fail."""
@@ -447,14 +512,20 @@ class CallAllocator:
                 worker_id=self._settings.worker_id,
                 failure_reason=reason,
             )
-            released = await release_agent(
-                cur,
-                agent_id=ticket.agent_id,
-                expected_version=ticket.agent_version,
-                expected_state=AgentState.DIALING,
-                now=now,
+            # An over-dial call has no agent to give back -- that is what makes
+            # it an over-dial call -- so there is nothing to release here.
+            released = (
+                None
+                if ticket.agent_id is None
+                else await release_agent(
+                    cur,
+                    agent_id=ticket.agent_id,
+                    expected_version=ticket.agent_version,
+                    expected_state=AgentState.DIALING,
+                    now=now,
+                )
             )
-            if released is None:
+            if released is None and ticket.agent_id is not None:
                 # Somebody else moved the agent -- most likely the reaper after
                 # a slow provider. Leave it alone rather than forcing a write.
                 self._log.warning(

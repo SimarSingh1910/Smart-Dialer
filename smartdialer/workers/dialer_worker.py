@@ -97,6 +97,7 @@ class DialerWorker:
             clock=clock,
             logger=self._log,
             max_signal_age_seconds=settings.max_signal_age_seconds,
+            worker_id=settings.worker_id,
         )
 
         self._bridger = CallBridger(
@@ -184,17 +185,28 @@ class DialerWorker:
                 cur, campaign=campaign, raw=raw, now=now
             )
 
-        health = await self._health_signal()
+        health_by_provider = await self._health_by_provider()
+        health = _worst_of(health_by_provider)
+        async with self._db.transaction() as cur:
+            # What the credit stood at when this tick began. Read here purely
+            # so it appears in the decision log alongside the snapshot it
+            # applies to; the authoritative read-modify-write is the locked one
+            # inside the safety controller, and this one deliberately takes no
+            # lock and blocks nothing.
+            credit = await self.controller.budget.read_credit(
+                cur, campaign_id=self._campaign_id
+            )
+
         snapshot = to_pacing_snapshot(
             raw,
             campaign=campaign,
             now=self._clock.now(),
             provider_health=health,
             history=history,
-            # Granted by the AIMD budget in step 8, where it becomes a ceiling
-            # the controller applies. Carried here only so it appears in the
-            # decision log; the engine does not spend it.
-            overdial_credit=0,
+            # Granted by the AIMD budget, where it is a ceiling the controller
+            # applies. Carried here only so it appears in the decision log; the
+            # engine does not read it and cannot spend it.
+            overdial_credit=credit,
         )
 
         proposal = propose(snapshot)
@@ -207,6 +219,11 @@ class DialerWorker:
             snapshot=snapshot,
             campaign=campaign,
             ts=now,
+            # The circuit breaker's own view of each carrier. Timeouts and
+            # unreachability are the two things the calls table cannot show:
+            # our response to a provider timeout is to touch nothing, so a
+            # timed-out call looks exactly like one still being set up.
+            health=health_by_provider,
             log_inputs={
                 "engine_reason": proposal.reason,
                 "engine_terms": proposal.terms,
@@ -255,18 +272,24 @@ class DialerWorker:
             self._history = self._history or empty_history(now)
         return self._history
 
-    async def _health_signal(self) -> ProviderHealthSignal:
-        """Reduce the carriers' health to the plain numbers the engine takes.
+    async def _health_by_provider(self) -> dict[str, ProviderHealthSignal]:
+        """Each carrier's health, as plain numbers, keyed by name.
 
-        Worst-of across providers, and a carrier that cannot even answer a
-        health question counts as unreachable rather than as unknown. The
-        conversion happens here so that `pacing` never imports `providers`.
+        Per provider rather than reduced, because the breaker routes: "one of
+        the two carriers is sick" and "both are sick" are the difference
+        between dialling through the other one and not dialling at all. The
+        engine still gets the worst-of reduction below, since it is choosing a
+        number rather than a route.
+
+        A carrier that cannot even answer a health question counts as
+        unreachable rather than as unknown. The conversion to the engine's own
+        dataclass happens here so that `pacing` never imports `providers`.
         """
-        worst: ProviderHealthSignal | None = None
+        signals: dict[str, ProviderHealthSignal] = {}
         for provider in self._providers.values():
             try:
                 health = await provider.health()
-                signal = ProviderHealthSignal(
+                signals[provider.name] = ProviderHealthSignal(
                     name=health.name,
                     reachable=health.reachable,
                     failure_rate=health.failure_rate,
@@ -275,15 +298,10 @@ class DialerWorker:
                     samples=health.samples,
                 )
             except Exception:  # noqa: BLE001
-                signal = ProviderHealthSignal(
+                signals[provider.name] = ProviderHealthSignal(
                     name=provider.name, reachable=False, failure_rate=1.0
                 )
-            if worst is None or (signal.failure_rate, not signal.reachable) > (
-                worst.failure_rate,
-                not worst.reachable,
-            ):
-                worst = signal
-        return worst or ProviderHealthSignal()
+        return signals
 
     # -- events ---------------------------------------------------------
 
@@ -356,6 +374,22 @@ class DialerWorker:
             task.cancel()
 
 
+
+
+def _worst_of(signals: dict[str, ProviderHealthSignal]) -> ProviderHealthSignal:
+    """The single health reading the pacing engine sees.
+
+    Worst-of, because the engine is forecasting exposure and the pessimistic
+    reading is the one that costs utilisation rather than abandoned calls.
+    """
+    worst: ProviderHealthSignal | None = None
+    for signal in signals.values():
+        if worst is None or (signal.failure_rate, not signal.reachable) > (
+            worst.failure_rate,
+            not worst.reachable,
+        ):
+            worst = signal
+    return worst or ProviderHealthSignal()
 
 
 def _snapshot_for_log(snapshot) -> dict:

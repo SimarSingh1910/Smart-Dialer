@@ -150,5 +150,6 @@ def reset(dsn: str) -> None:
         with conn.transaction():
             conn.execute(
                 "TRUNCATE provider_events, pacing_decisions, calls, "
-                "campaign_counters, borrowers, agents, campaigns RESTART IDENTITY"
+                "campaign_safety_state, campaign_counters, borrowers, agents, "
+                "campaigns RESTART IDENTITY"
             )

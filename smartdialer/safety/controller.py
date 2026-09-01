@@ -35,18 +35,19 @@ crashes into "carry on" is not a safety component, and the cost of being wrong
 in this direction is idle agents, while the cost of being wrong in the other is
 a compliance event.
 
-Two clamps named in the design are not here yet and their slots are marked
-below: the AIMD abandon-budget credit and the provider circuit breaker both
-arrive in step 8. Their absence is safe rather than merely unfinished -- with
-no credit granted, the engine's predictive path proposes the progressive floor,
-which is what every clamp here degrades to anyway.
+Two of the seven clamps need measured state that only the database holds --
+the AIMD over-dial credit and the provider circuit breaker. Both are evaluated
+in _execute, in one short transaction, and handed to _decide as plain numbers.
+That keeps the clamp arithmetic pure while still making both of them ceilings
+the engine cannot influence: they are computed from abandoned calls and failed
+calls, and there is no input to either that the pacing engine produces.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Mapping
 from uuid import UUID
 
 from smartdialer.allocator.allocator import CallAllocator, DialTicket
@@ -57,6 +58,8 @@ from smartdialer.core.models import Campaign
 from smartdialer.domain.decisions import Shortfall, record_decision
 from smartdialer.domain.snapshot import is_within_dialing_window
 from smartdialer.pacing.engine import PacingProposal, PacingSnapshot
+from smartdialer.safety.breaker import BreakerState, BreakerView, CircuitBreaker
+from smartdialer.safety.budget import AbandonBudget, BudgetState, CreditReason
 
 
 class Reason:
@@ -75,10 +78,31 @@ class Reason:
     HARD_RATIO = "HARD_RATIO"
     CAMPAIGN_CONCURRENCY = "CAMPAIGN_CONCURRENCY"
     EXCEPTION = "EXCEPTION"
-    # Reserved for step 8, so the vocabulary does not change under the
-    # simulation's reporting when they arrive.
     ABANDON_BUDGET = "ABANDON_BUDGET"
     PROVIDER_BREAKER = "PROVIDER_BREAKER"
+
+
+@dataclass(frozen=True, slots=True)
+class SafetyInputs:
+    """The two clamps that have to be read from the database, as plain numbers.
+
+    Passed in rather than fetched, so _decide stays a pure function of measured
+    state. Both numbers use None for "this clamp did not participate", which is
+    a different sentence in a decision log from "this clamp allowed a lot" --
+    the breaker is closed, or the budget was never consulted because this call
+    is a clamp test rather than a tick.
+
+    The fail-closed guarantee does not depend on the defaults here. execute()
+    always supplies both, and if reading either one raises, the wrapper turns
+    the whole tick into approved = 0.
+    """
+
+    overdial_credit: int | None = None
+    credit_reason: str = CreditReason.STEADY
+    breaker_state: str = BreakerState.CLOSED
+    breaker_allowance: int | None = None
+    provider: str | None = None
+    terms: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +117,11 @@ class SafetyDecision:
     reason_code: str
     clamps: tuple[str, ...] = ()
     terms: dict[str, Any] = field(default_factory=dict)
+    # How many of the approved calls are over the progressive floor. These are
+    # the calls placed with no agent behind them, and the number is exactly the
+    # credit that was spent on this tick.
+    overdial: int = 0
+    provider: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +150,10 @@ class ExecutionResult:
     def clamps(self) -> tuple[str, ...]:
         return self.decision.clamps
 
+    @property
+    def overdial(self) -> int:
+        return self.decision.overdial
+
 
 class SafetyController:
     def __init__(
@@ -131,12 +164,15 @@ class SafetyController:
         clock: Clock,
         logger: StructuredLogger,
         max_signal_age_seconds: float = 5.0,
+        worker_id: str = "worker",
     ) -> None:
         self._allocator = allocator
         self._db = db
         self._clock = clock
         self._log = logger
         self._max_signal_age = max_signal_age_seconds
+        self.budget = AbandonBudget()
+        self.breaker = CircuitBreaker(worker_id=worker_id)
         # The operator's stop button. Separate from campaigns.active, which is
         # campaign policy: this one stops THIS process immediately without a
         # database round trip, for when somebody needs the dialling to stop now
@@ -150,6 +186,7 @@ class SafetyController:
         proposal: PacingProposal,
         snapshot: PacingSnapshot,
         campaign: Campaign,
+        safety: SafetyInputs | None = None,
     ) -> SafetyDecision:
         """Apply every clamp, in order. No I/O, and none possible.
 
@@ -158,8 +195,9 @@ class SafetyController:
         "the concurrency cap was checked and had room".
         """
         n = max(0, proposal.n)
+        safety = safety or SafetyInputs()
         clamps: list[str] = []
-        terms: dict[str, Any] = {"proposed": proposal.n}
+        terms: dict[str, Any] = {"proposed": proposal.n, **safety.terms}
 
         def clamp(limit: int, reason: str) -> None:
             nonlocal n
@@ -221,12 +259,34 @@ class SafetyController:
             Reason.CAMPAIGN_CONCURRENCY,
         )
 
-        # --- step 8 slots in here -------------------------------------
-        # 6. ABANDON_BUDGET: clamp to agents_available + AIMD over-dial credit.
-        # 7. PROVIDER_BREAKER: CLOSED passes, HALF_OPEN allows one probe call,
-        #    OPEN approves nothing while existing calls keep reconciling.
-        # Both are ceilings computed from measured outcomes, so they belong in
-        # this sequence and nowhere else.
+        # 6. The abandon budget. This is the clamp that makes predictive mode
+        #    predictive: everything up to agents_available is the progressive
+        #    floor and needs no permission, and the credit on top is the entire
+        #    over-dial allowance. The credit is earned one clean tick at a time
+        #    and halved by a single abandoned call, so a model that has become
+        #    confident cannot buy any of it -- only a run of ticks that
+        #    abandoned nobody can.
+        terms["overdial_credit"] = safety.overdial_credit
+        terms["credit_reason"] = safety.credit_reason
+        if safety.overdial_credit is not None:
+            clamp(
+                snapshot.agents_available + safety.overdial_credit,
+                Reason.ABANDON_BUDGET,
+            )
+
+        # 7. The circuit breaker. CLOSED does not constrain; HALF_OPEN allows
+        #    the single probe call whichever worker claimed it; OPEN allows
+        #    nothing new. Existing calls are untouched either way -- the reaper
+        #    keeps reconciling them, because some of them have a real person on
+        #    the line and cancelling those would be the one action that makes a
+        #    provider outage worse than it already is.
+        terms["breaker_state"] = safety.breaker_state
+        if safety.breaker_allowance is not None:
+            clamp(safety.breaker_allowance, Reason.PROVIDER_BREAKER)
+
+        # Over the progressive floor, these calls have no agent behind them.
+        overdial = max(0, n - snapshot.agents_available)
+        terms["overdial"] = overdial
 
         if n <= 0:
             return SafetyDecision(
@@ -235,6 +295,7 @@ class SafetyController:
                 reason_code=clamps[-1] if clamps else Reason.NOTHING_PROPOSED,
                 clamps=tuple(clamps),
                 terms=terms,
+                provider=safety.provider,
             )
 
         return SafetyDecision(
@@ -243,6 +304,8 @@ class SafetyController:
             reason_code=clamps[-1] if clamps else Reason.UNCLAMPED,
             clamps=tuple(clamps),
             terms=terms,
+            overdial=overdial,
+            provider=safety.provider,
         )
 
     # -- the wrapper ----------------------------------------------------
@@ -254,6 +317,7 @@ class SafetyController:
         snapshot: PacingSnapshot,
         campaign: Campaign,
         ts: datetime,
+        health: Mapping[str, Any] | None = None,
         log_inputs: dict[str, Any] | None = None,
     ) -> ExecutionResult:
         """Decide, reserve, record, then dial.
@@ -271,6 +335,7 @@ class SafetyController:
                 snapshot=snapshot,
                 campaign=campaign,
                 ts=ts,
+                health=health or {},
                 log_inputs=log_inputs or {},
             )
         except Exception as exc:  # noqa: BLE001 - this is the fail-closed net
@@ -306,13 +371,22 @@ class SafetyController:
         snapshot: PacingSnapshot,
         campaign: Campaign,
         ts: datetime,
+        health: Mapping[str, Any],
         log_inputs: dict[str, Any],
     ) -> ExecutionResult:
-        decision = self._decide(proposal, snapshot, campaign)
+        safety = await self._read_safety_state(
+            campaign=campaign, snapshot=snapshot, proposal=proposal, now=ts, health=health
+        )
+        decision = self._decide(proposal, snapshot, campaign, safety)
 
         batch = None
         if decision.approved > 0:
-            batch = await self._allocator.reserve(campaign=campaign, n=decision.approved)
+            batch = await self._allocator.reserve(
+                campaign=campaign,
+                n=decision.approved,
+                overdial=decision.overdial,
+                provider_name=decision.provider,
+            )
 
         dialed = len(batch.tickets) if batch else 0
         shortfall = batch.shortfall_reason if batch else Shortfall.NONE
@@ -348,6 +422,55 @@ class SafetyController:
             shortfall_reason=shortfall,
             tickets=batch.tickets if batch else (),
             decision_id=decision_id,
+        )
+
+    async def _read_safety_state(
+        self,
+        *,
+        campaign: Campaign,
+        snapshot: PacingSnapshot,
+        proposal: PacingProposal,
+        now: datetime,
+        health: Mapping[str, Any],
+    ) -> SafetyInputs:
+        """Advance the AIMD credit and read the breaker, in one transaction.
+
+        One transaction because both lock the same row, and locking it twice
+        per tick would be two round trips to learn one thing. A SHORT
+        transaction, and deliberately not the one that later writes the
+        decision row: that one spans the allocator, the carrier hand-off and a
+        second commit, and holding a campaign-wide row lock across all of it
+        would serialise every worker on the campaign behind the slowest one --
+        the exact contention the safety row was split off `campaigns` to avoid.
+
+        Nothing here reads the proposal except `changepoint_detected`, and that
+        is the engine reporting that its own model just broke. It can only
+        reduce the credit; there is no value it can carry that raises one.
+        """
+        provider_names = [p.name for p in self._allocator.providers]
+        async with self._db.transaction() as cur:
+            budget: BudgetState = await self.budget.evaluate(
+                cur,
+                campaign=campaign,
+                agents_available=snapshot.agents_available,
+                changepoint=proposal.changepoint_detected,
+                now=now,
+            )
+            view: BreakerView = await self.breaker.evaluate(
+                cur,
+                campaign_id=campaign.id,
+                providers=provider_names,
+                health=health,
+                now=now,
+            )
+
+        return SafetyInputs(
+            overdial_credit=budget.credit,
+            credit_reason=budget.reason,
+            breaker_state=view.state,
+            breaker_allowance=view.allowance,
+            provider=view.provider,
+            terms={"budget": budget.terms, "breaker": view.terms},
         )
 
     async def _try_record(
