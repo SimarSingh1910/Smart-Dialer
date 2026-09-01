@@ -324,8 +324,31 @@ Measured by `python tasks.py loadtest`: 1,000 agents, 20 worker coroutines, 60
 seconds of virtual time, one local PostgreSQL.
 
 ```
-LOADTEST_NUMBERS
+agents                  1000        worker coroutines       20
+ticks                   4800        ticks/sec               59
+reservation latency p50 1.21 ms     reservation latency p99  87.33 ms
+calls placed            2711        db round trips per call  43.0
+
+allocation query   Bitmap Index Scan on agents_campaign_state_idx -> LockRows
+                   -> Limit -> Update.  0.12 ms, 18 buffers, all shared hits.
+snapshot query     one statement, 15 CTEs, 8.97 ms, 160 buffers -- but two of
+                   its CTEs are Seq Scans on `calls` filtered by campaign and
+                   a 60s window, which is the next thing to index.
 ```
+
+Two things stand out. The allocation query is exactly what it was designed to
+be: an index scan into `LockRows`, a fraction of a millisecond, no heap
+scanning. And the p99 of 87ms against a p50 of 1.2ms is the contention this
+test exists to find -- twenty workers arriving at the head of the same index in
+the same instant, which is the 1,000-agent break described below.
+
+The 43 round trips per call is the number I would attack first, and it is not
+43 queries per call: it is ~24 queries per tick (snapshot, history refresh,
+safety row, decision row, reservation) divided by the calls that tick happened
+to place. At 20 workers x 4 ticks/sec, most of that is twenty workers computing
+the same campaign snapshot twenty times. One pacing leader per campaign,
+elected with `pg_try_advisory_lock`, would divide it by the worker count
+without adding a component.
 
 **100 agents.** Nothing. One process, one database, a few calls per second of
 state churn.

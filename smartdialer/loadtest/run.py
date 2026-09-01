@@ -273,27 +273,32 @@ async def _plans(pool: Database, campaign_id: uuid.UUID, clock) -> dict[str, str
     now = clock.now()
     try:
         async with pool.transaction() as cur:
-        await cur.execute(
-            "EXPLAIN (ANALYZE, BUFFERS) " + RESERVE_AGENTS_SQL,
-            {
-                "campaign_id": campaign_id,
-                "worker_id": "explain",
-                "n": 20,
-                "lease_seconds": 5.0,
-                "now": now,
-            },
-        )
-        plans["allocation (SKIP LOCKED)"] = "\n".join(
-            row["QUERY PLAN"] for row in await cur.fetchall()
-        )
+            await cur.execute(
+                "EXPLAIN (ANALYZE, BUFFERS) " + RESERVE_AGENTS_SQL,
+                {
+                    "campaign_id": campaign_id,
+                    "worker_id": "explain",
+                    "n": 20,
+                    "lease_seconds": 5.0,
+                    "now": now,
+                },
+            )
+            plans["allocation (SKIP LOCKED)"] = "\n".join(
+                row["QUERY PLAN"] for row in await cur.fetchall()
+            )
 
-        await cur.execute(
-            "EXPLAIN (ANALYZE, BUFFERS) " + SNAPSHOT_SQL,
-            _snapshot_params(campaign_id, now),
-        )
-        plans["snapshot"] = "\n".join(row["QUERY PLAN"] for row in await cur.fetchall())
+            await cur.execute(
+                "EXPLAIN (ANALYZE, BUFFERS) " + SNAPSHOT_SQL,
+                _snapshot_params(campaign_id, now),
+            )
+            plans["snapshot"] = "\n".join(
+                row["QUERY PLAN"] for row in await cur.fetchall()
+            )
 
-        raise _Rollback()
+            # Undo the reservations the first EXPLAIN really did make.
+            raise _Rollback()
+    except _Rollback:
+        pass
     return plans
 
 
@@ -307,7 +312,8 @@ def _snapshot_params(campaign_id: uuid.UUID, now: datetime) -> dict[str, Any]:
     return {
         "campaign_id": campaign_id,
         "now": now,
-        "window_seconds": 60.0,
+        "window": snap.DEFAULT_WINDOW_SECONDS,
+        "baseline_window": snap.BASELINE_WINDOW_SECONDS,
         "changepoint_span": snap.CHANGEPOINT_SPAN_SECONDS,
         "changepoint_lag": snap.CHANGEPOINT_LAG_SECONDS,
     }
